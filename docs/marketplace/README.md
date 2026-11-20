@@ -75,10 +75,10 @@ Still to do (needs your YouTrack, your accounts or your decision):
 - [x] **License:** Apache License 2.0. LICENSE and NOTICE are in the ZIP, and each source file has the Apache notice.
   Because it is an open-source license, the Source code URL field is required (JetBrains Marketplace approval
   guidelines): the public repository below.
-- [ ] **Links:** the repository is https://github.com/delgarathor/YouTrack-SpreadsheetsforYouTrack, and
+- [ ] **Links:** the repository is https://github.com/oguzhancngiz/YouTrack-SpreadsheetsforYouTrack, and
   `manifest.json` has it as `url`. All links on the listing must be reachable, so upload to the Marketplace only after
   the repository is public with Issues on. Source code URL: the repository; Issue tracker:
-  https://github.com/delgarathor/YouTrack-SpreadsheetsforYouTrack/issues.
+  https://github.com/oguzhancngiz/YouTrack-SpreadsheetsforYouTrack/issues.
 - [ ] **Price:** the listing doesn't mention one. If the app is free, you can add "Spreadsheets for YouTrack is free." If it is paid,
   add a licensing section and a support email (answers within 2 business days for critical requests).
 - [ ] **Downloads by readers:** everyone who can see an issue can download its spreadsheet. The listing says so. If
