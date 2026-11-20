@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Spreadsheets for YouTrack settings",
+  "description": "Who can view and edit the spreadsheets in issues of this project.",
+  "properties": {
+    "readersCanEdit": {
+      "type": "boolean",
+      "title": "Everyone who can see the issue can edit",
+      "description": "Off (default): users with the Update Issue permission in this project can create and edit spreadsheets, from whichever role grants it (global, project or custom roles); users who can only read the issue can view them. On: every user who can see the issue can edit.",
+      "x-scope": "PROJECT"
+    },
+    "editorGroups": {
+      "type": "array",
+      "title": "Groups that can edit spreadsheets",
+      "description": "Members can create and edit spreadsheets in the issues they can see, even without the Update Issue permission.",
+      "items": {
+        "type": "object",
+        "x-entity": "UserGroup"
+      },
+      "x-scope": "PROJECT"
+    },
+    "viewerGroups": {
+      "type": "array",
+      "title": "Groups that can only view spreadsheets",
+      "description": "Members can view spreadsheets but never create or edit them, even when they can update the issue. This overrides the two settings above.",
+      "items": {
+        "type": "object",
+        "x-entity": "UserGroup"
+      },
+      "x-scope": "PROJECT"
+    }
+  }
+}

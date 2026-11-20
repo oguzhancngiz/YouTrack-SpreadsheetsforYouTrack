@@ -1,0 +1,6 @@
+# build output and release bundles
+dist/
+release/
+*.zip
+__pycache__/
+.claude/

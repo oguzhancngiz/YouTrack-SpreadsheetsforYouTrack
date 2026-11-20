@@ -1,0 +1,68 @@
+<!doctype html>
+<!--
+  Copyright 2026 Codeo
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spreadsheets for YouTrack</title>
+  <link rel="stylesheet" href="ring-variables.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body class="mode-inline">
+  <div class="app" id="app">
+    <header class="bar" id="bar">
+      <span class="ro-tag" id="roTag" hidden title="You can see this spreadsheet but not edit it.">View only</span>
+      <span class="bar-meta" id="barMeta"></span>
+      <span class="spacer"></span>
+      <div class="peers" id="peers" aria-label="People working on this spreadsheet"></div>
+      <span class="save-state" id="saveState" aria-live="polite"></span>
+      <button class="icon-btn" id="moreBtn" type="button" aria-label="Spreadsheet actions" title="Spreadsheet actions" data-popup-anchor></button>
+    </header>
+    <div class="body" id="body" hidden>
+      <div class="empty" id="empty" hidden></div>
+      <div class="sheet-ui" id="sheetUi" hidden>
+        <div class="menubar" id="menubar" role="menubar"></div>
+        <div class="toolbar" id="toolbar" role="toolbar" aria-label="Formatting"></div>
+        <div class="fbar">
+          <input class="name-box" id="nameBox" aria-label="Cell address or name" spellcheck="false" autocomplete="off">
+          <button class="icon-btn fx-btn" id="fxBtn" type="button" title="Insert function" aria-label="Insert function"></button>
+          <textarea class="fbar-input" id="fbar" rows="1" spellcheck="false" aria-label="Cell content"></textarea>
+        </div>
+        <div class="grid-wrap" id="gridWrap">
+          <div class="grid-inner" id="gridInner">
+            <table class="grid" id="grid" role="grid" aria-label="Spreadsheet"></table>
+            <div class="charts-layer" id="chartsLayer"></div>
+            <textarea class="cell-editor" id="cellEditor" spellcheck="false" hidden aria-label="Edit cell"></textarea>
+          </div>
+        </div>
+        <div class="tabs-bar">
+          <button class="icon-btn" id="addSheet" type="button" title="Add sheet" aria-label="Add sheet"></button>
+          <button class="icon-btn" id="allSheets" type="button" title="All sheets" aria-label="All sheets" data-popup-anchor></button>
+          <div class="tabs" id="tabs" role="tablist"></div>
+          <div class="status" id="status"></div>
+          <span id="zoom"></span>
+        </div>
+      </div>
+      <div class="vresize" id="vresize" title="Drag to resize, double-click to reset" tabindex="0" role="separator" aria-orientation="horizontal" aria-label="Resize the spreadsheet"></div>
+    </div>
+  </div>
+  <textarea class="kbd-trap" id="kbd" aria-label="Spreadsheet keyboard input" autocomplete="off" spellcheck="false"></textarea>
+  <input type="file" id="fileInput" accept=".xlsx,.csv,.tsv,.txt,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" hidden>
+  <script src="sheet-core.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

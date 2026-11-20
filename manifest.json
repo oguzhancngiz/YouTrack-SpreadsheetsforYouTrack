@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/youtrack-app.json",
+  "name": "spreadsheets-for-youtrack",
+  "title": "Spreadsheets for YouTrack",
+  "description": "A shared spreadsheet in YouTrack issues. Keep estimates, budgets, test matrices and release checklists in the issue they belong to. Spreadsheets for YouTrack adds a Spreadsheet section above the issue's activity stream, which you collapse and expand with its header like other issue sections. The Open spreadsheet item in the issue's options menu shows the same spreadsheet in a large window. The spreadsheet has 314 functions, tables, filters, conditional formatting, data validation, 8 chart types, several sheets, Solver, Goal Seek and scenarios, .xlsx and .csv import and export, and a change history. Users with the Update Issue permission in the project can edit the spreadsheet, and other users who can see the issue can view it. Project settings choose groups that can edit or only view spreadsheets, or let everyone who can see the issue edit. Data is stored in your YouTrack, and the app makes no external network requests.",
+  "version": "1.2.5",
+  "minYouTrackVersion": "2026.2.0",
+  "changeNotes": "1.2.5: New logo. 1.2.4: Formula separators moved from the bar's ⋯ menu to More tools (the ⋯ at the end of the toolbar), which is now always shown. The language that YouTrack reports is recognized also when written like tr_TR, so Automatic picks the right separators. 1.2.3: The app is now called Spreadsheets for YouTrack and has an updated logo. Formula separators follow your language: where decimals are written with a comma, formulas use ; between arguments and , in numbers (=ROUND(1,5; 0)); View > Formula separators switches between comma and semicolon. Download sheet as CSV lets you choose comma, semicolon or tab and the decimal separator. Formula separators are also in the bar's ⋯ menu. Menu buttons and color pickers close on a second click. Fixed: formulas typed with semicolons were written to .xlsx files with semicolons. 1.2.2: Fixed: selecting several cells showed an error and a change made to the selection was not saved (1.2.1). A spreadsheet that cannot be loaded shows Try again. Moving through the Solver dialog with Tab no longer switches the objective to Value of. Adding a sheet leaves the focus in the grid. 1.2.1: Fixes from testing on YouTrack Cloud: whole numbers with 11 digits are shown exactly; dialogs keep the keyboard focus; the large window fits laptop screens; Cut, Copy and Paste in the menu work within the spreadsheet; switching menus takes one click; dropdown lists never cover their button; the status bar shows averages rounded; the change history shows a loader and closes with Esc; Scenario Manager selects new scenarios and closes after Summary. 1.2.0: Fixed: users who could only read an issue could create and edit its spreadsheet; editing now needs YouTrack's Update Issue permission in the project, whichever role grants it. New project settings: groups that can edit spreadsheets and groups that can only view them. The spreadsheet uses YouTrack's own Spreadsheet section header (no duplicate title or second collapse button). Native Ring UI look: dropdowns, dialogs, single-row toolbar with More tools, sheet tabs, notifications; readable user colors in the dark theme; no editing controls for view-only users. 1.1.0: What-if analysis. Solver with the Simplex LP, GRG Nonlinear (with Multistart) and Evolutionary methods; constraints with ≤, =, ≥, integer, binary and AllDifferent; Answer, Sensitivity, Limits, Population, Feasibility, Feasibility-Bounds and Linearity reports; models saved with each sheet and in cells (Load/Save). Goal Seek, and the Scenario Manager with summaries and merging. Solver models and scenarios are kept in .xlsx downloads and read from .xlsx imports. Sheets grow past 100 rows and 26 columns as you move or scroll past them (up to 20,000 rows and 200 columns), and double-clicking a cell edits it. 1.0.1: Fixed: users who can update the issue could not create or edit the spreadsheet. Edit rights now follow YouTrack's permissions on each issue (global and project roles, custom roles, the issue's access settings) and change without reloading. 1.0.0: First release. Spreadsheet bar above the issue's activity stream that expands and collapses, and an Open spreadsheet item in the issue's options menu that shows a large window. Shared editing with presence, change history with restore, and undo and redo. 314 functions, dynamic arrays, named ranges and table references. Tables, filters, sorting, number formats, conditional formatting, data validation and 8 chart types. .xlsx and .csv import and export, and copy and paste with other spreadsheet apps. Project setting that lets everyone who can see the issue edit. Follows the YouTrack light and dark themes.",
+  "vendor": {
+    "name": "Codeo"
+  },
+  "url": "https://github.com/codeo-engineering/YouTrack-SpreadsheetsforYouTrack",
+  "icon": "icon.svg",
+  "iconDark": "icon-dark.svg",
+  "widgets": [
+    {
+      "key": "issue-sheet",
+      "name": "Spreadsheet",
+      "description": "Spreadsheet section above the issue's activity stream.",
+      "extensionPoint": "ISSUE_ABOVE_ACTIVITY_STREAM",
+      "indexPath": "sheet/index.html",
+      "iconPath": "sheet/icon.svg",
+      "permissions": [
+        "READ_ISSUE"
+      ]
+    },
+    {
+      "key": "issue-sheet-window",
+      "name": "Open spreadsheet",
+      "description": "Opens the issue's spreadsheet in a large window.",
+      "extensionPoint": "ISSUE_OPTIONS_MENU_ITEM",
+      "indexPath": "sheet/window.html",
+      "iconPath": "sheet/icon.svg",
+      "permissions": [
+        "READ_ISSUE"
+      ],
+      "expectedDimensions": {
+        "width": 1280,
+        "height": 640
+      }
+    }
+  ]
+}

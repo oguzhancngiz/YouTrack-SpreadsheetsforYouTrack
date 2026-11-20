@@ -1,0 +1,19 @@
+{
+  "entityTypeExtensions": [
+    {
+      "entityType": "Issue",
+      "properties": {
+        "sheetDoc": { "type": "string" },
+        "sheetLog": { "type": "string" },
+        "sheetHistory": { "type": "string" }
+      }
+    },
+    {
+      "entityType": "User",
+      "properties": {
+        "sheetPresence": { "type": "string" },
+        "sheetPresenceIssue": { "type": "string" }
+      }
+    }
+  ]
+}

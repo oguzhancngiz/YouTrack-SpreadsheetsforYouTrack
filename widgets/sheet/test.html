@@ -1,0 +1,422 @@
+<!doctype html>
+<!--
+  Copyright 2026 Codeo
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Spreadsheets for YouTrack – engine tests</title>
+<style>body{font:13px system-ui;margin:16px}.fail{color:#c00}.ok{color:#080}pre{white-space:pre-wrap}</style></head>
+<body>
+<h1>Formula engine tests</h1>
+<div id="sum"></div>
+<pre id="out"></pre>
+<script src="sheet-core.js"></script>
+<script type="module">
+import { Engine, parseInput, formatValue, translateFormula, shiftFormula, renameSheetInFormula, isErr, formatWithPattern, formulaToLocal, formulaFromLocal, separatorStyle, helpToLocal } from './formula.js';
+import * as M from './model.js';
+const Core = window.SheetCore;
+
+// Build a workbook from a grid of raw values
+function mk(name, grid) {
+  const sh = Core.newSheet(name, 60, 12);
+  grid.forEach((row, r) => row.forEach((v, c) => { if (v !== null && v !== undefined && v !== '') sh.cells[sh.rows[r] + ':' + sh.cols[c]] = { v: String(v) }; }));
+  return sh;
+}
+const s1 = mk('Sheet1', [
+  ['Item', 'Qty', 'Price', 'Date', 'Cat'],
+  ['Laptop', 3, 1250.5, 46000, 'A'],
+  ['Monitor', 5, 320, 46010, 'B'],
+  ['Keyboard', 12, 45.9, 46020, 'A'],
+  ['Mouse', 20, 19.99, 46030, 'C'],
+  ['Cable', '', 5, 46040, 'B']
+]);
+const s2 = mk('Data 2', [[10, 20], [30, 40]]);
+const doc = { sheets: [s1, s2], names: { RATE: '=0.18', PRICES: "=Sheet1!$C$2:$C$6" } };
+doc.sheets.forEach((s) => { s.tables = []; });
+s1.tables.push({ id: 't1', name: 'Sales', r1: s1.rows[0], c1: s1.cols[0], r2: s1.rows[5], c2: s1.cols[4], header: true });
+const book = {
+  sheets: doc.sheets, names: doc.names,
+  findTable: (n) => M.findTable(engine, doc, n, 1, 'en-US'),
+  tableAt: (sh, r, c) => M.tableAt(engine, sh, r, c, 1, 'en-US'),
+  hidden: {},          // "sheetId|r" → 'manual' | 'filter' (set by the tests)
+  rowHidden(sh, r) { return this.hidden[sh.id + '|' + r] || null; }
+};
+const engine = new Engine(book, 'en-US');
+
+const results = [];
+function ev(f, at = [20, 8]) {
+  // write the formula into a free cell and read it back
+  const k = s1.rows[at[0]] + ':' + s1.cols[at[1]];
+  s1.cells[k] = { v: f };
+  engine.invalidate();
+  const v = engine.valueAt(s1, at[0], at[1]);
+  delete s1.cells[k];
+  return v;
+}
+function eq(f, expected, tol = 1e-9) {
+  const v = ev(f);
+  let ok;
+  if (typeof expected === 'number' && typeof v === 'number') ok = Math.abs(v - expected) <= tol * Math.max(1, Math.abs(expected));
+  else if (typeof expected === 'string' && expected[0] === '#') ok = isErr(v) && v.code === expected;
+  else ok = JSON.stringify(v) === JSON.stringify(expected);
+  results.push({ ok, f, v: isErr(v) ? v.code : v, expected });
+}
+const t = (name, fn) => { try { fn(); } catch (e) { results.push({ ok: false, f: name, v: 'threw ' + e.message, expected: '' }); } };
+
+t('basics', () => {
+  eq('=1+2*3', 7); eq('=(1+2)*3', 9); eq('=2^3^2', 64); eq('=-2^2', 4); eq('=10%', 0.1); eq('="a"&"b"&1', 'ab1');
+  eq('=1/0', '#DIV/0!'); eq('=B2*C2', 3751.5); eq('=SUM(B2:B6)', 40); eq('=SUM(B:B)', 40); eq('=AVERAGE(B2:B6)', 10);
+  eq("='Data 2'!B2", 40); eq("=SUM('Data 2'!A1:B2)", 100); eq('=RATE*100', 18); eq('=SUM(PRICES)', 1641.39);
+  eq('=COUNT(B2:B6)', 4); eq('=COUNTA(A2:A6)', 5); eq('=COUNTBLANK(B2:B6)', 1); eq('=MAX(C2:C6)', 1250.5); eq('=MIN(C2:C6)', 5);
+  eq('=1=1', true); eq('="A"="a"', true); eq('=2>"1"', false); eq('=TRUE+1', 2); eq('=NOPE(1)', '#NAME?'); eq('=SUM(1,', '#ERROR!');
+});
+t('conditional aggregates', () => {
+  eq('=SUMIF(E2:E6,"A",C2:C6)', 1296.4); eq('=COUNTIF(B2:B6,">4")', 3); eq('=COUNTIF(A2:A6,"M*")', 2); eq('=SUMIFS(B2:B6,E2:E6,"A",C2:C6,">100")', 3);
+  eq('=AVERAGEIF(E2:E6,"B",C2:C6)', 162.5); eq('=COUNTIFS(E2:E6,"<>A")', 3); eq('=MAXIFS(C2:C6,E2:E6,"A")', 1250.5); eq('=MINIFS(C2:C6,E2:E6,"B")', 5);
+  eq('=SUMPRODUCT(B2:B5,C2:C5)', 6302.1); eq('=SUM(B2:B5*C2:C5)', 6302.1);
+});
+t('logic', () => {
+  eq('=IF(B2>2,"y","n")', 'y'); eq('=IF(FALSE,1)', false); eq('=IFS(B3>10,"a",B3>4,"b")', 'b'); eq('=IFERROR(1/0,"x")', 'x'); eq('=IFNA(NA(),"z")', 'z');
+  eq('=AND(1,TRUE,B2>0)', true); eq('=OR(FALSE,0)', false); eq('=XOR(TRUE,TRUE)', false); eq('=NOT(0)', true); eq('=SWITCH(E3,"A",1,"B",2,0)', 2);
+  eq('=CHOOSE(2,"a","b","c")', 'b'); eq('=LET(x,2,y,x*3,x+y)', 8);
+});
+t('lookup', () => {
+  eq('=VLOOKUP("Mouse",A2:D6,3,FALSE)', 19.99); eq('=HLOOKUP("Price",A1:E6,3,FALSE)', 320); eq('=INDEX(A2:C6,2,3)', 320); eq('=MATCH("Keyboard",A2:A6,0)', 3);
+  eq('=XLOOKUP("Cable",A2:A6,C2:C6)', 5); eq('=XLOOKUP("zzz",A2:A6,C2:C6,"none")', 'none'); eq('=VLOOKUP(15,{0,"low";10,"mid";20,"high"},2,TRUE)', 'mid');
+  eq('=XMATCH("Mouse",A2:A6)', 4); eq('=LOOKUP(25,{10,20,30},{"a","b","c"})', 'b'); eq('=ROWS(A2:C6)', 5); eq('=COLUMNS(A2:C6)', 3);
+  eq('=SUM(OFFSET(B2,0,0,2,1))', 8); eq('=INDIRECT("C"&3)', 320); eq('=ADDRESS(2,3)', '$C$2'); eq('=ROW(C5)', 5); eq('=COLUMN(D1)', 4);
+  eq('=SUM(INDEX(B2:C6,0,1))', 40);
+});
+t('text', () => {
+  eq('=LEFT("Hello",2)', 'He'); eq('=RIGHT("Hello",3)', 'llo'); eq('=MID("Hello",2,3)', 'ell'); eq('=LEN("çğüş")', 4); eq('=UPPER("istanbul")', 'ISTANBUL');
+  eq('=PROPER("john SMITH")', 'John Smith'); eq('=TRIM("  a   b ")', 'a b'); eq('=SUBSTITUTE("a-b-c","-","+")', 'a+b+c'); eq('=SUBSTITUTE("a-b-c","-","+",2)', 'a-b+c');
+  eq('=FIND("l","Hello")', 3); eq('=SEARCH("L","Hello")', 3); eq('=REPT("ab",3)', 'ababab'); eq('=CONCAT(A2:A3)', 'LaptopMonitor'); eq('=TEXTJOIN(", ",TRUE,A2:A4)', 'Laptop, Monitor, Keyboard');
+  eq('=TEXT(1234.5,"#,##0.00")', '1,234.50'); eq('=TEXT(0.256,"0.0%")', '25.6%'); eq('=TEXT(46000,"yyyy-mm-dd")', '2025-12-09'); eq('=VALUE("12.5")', 12.5);
+  eq('=TEXTBEFORE("a@b.c","@")', 'a'); eq('=TEXTAFTER("a@b.c","@")', 'b.c'); eq('=EXACT("a","A")', false); eq('=REGEXTEST("abc123","\\d+")', true);
+  eq('=REGEXEXTRACT("Order 4521 ok","\\d+")', '4521'); eq('=REGEXREPLACE("a1b2","\\d","#")', 'a#b#'); eq('=CHAR(65)', 'A'); eq('=CODE("A")', 65);
+});
+t('dates', () => {
+  eq('=DATE(2026,1,31)', 46053); eq('=YEAR(46053)', 2026); eq('=MONTH(46053)', 1); eq('=DAY(46053)', 31); eq('=EDATE(DATE(2026,1,31),1)', 46081);
+  eq('=EOMONTH(DATE(2026,2,10),0)', 46081); eq('=WEEKDAY(DATE(2026,11,17))', 3); eq('=DATEDIF(DATE(2020,5,10),DATE(2026,11,17),"Y")', 6);
+  eq('=NETWORKDAYS(DATE(2026,11,2),DATE(2026,11,13))', 10); eq('=WORKDAY(DATE(2026,11,13),1)', 46342); eq('=DAYS(DATE(2026,12,31),DATE(2026,1,1))', 364);
+  eq('=HOUR(0.75)', 18); eq('=TIME(6,30,0)', 0.2708333333); eq('=ISOWEEKNUM(DATE(2026,1,1))', 1); eq('=YEARFRAC(DATE(2026,1,1),DATE(2026,7,1))', 0.5);
+});
+t('math & stats', () => {
+  eq('=ROUND(2.345,2)', 2.35); eq('=ROUND(-2.5,0)', -3); eq('=ROUNDUP(2.341,2)', 2.35); eq('=ROUNDDOWN(-2.349,2)', -2.34); eq('=MOD(-3,2)', 1); eq('=INT(-2.5)', -3);
+  eq('=CEILING(4.2,0.5)', 4.5); eq('=FLOOR(4.7,0.5)', 4.5); eq('=MEDIAN(1,3,2,4)', 2.5); eq('=STDEV(2,4,4,4,5,5,7,9)', 2.138089935); eq('=STDEV.P(2,4,4,4,5,5,7,9)', 2);
+  eq('=LARGE(B2:B6,2)', 12); eq('=SMALL(B2:B6,1)', 3); eq('=RANK(12,B2:B6)', 2); eq('=PERCENTILE(B2:B5,0.5)', 8.5); eq('=QUARTILE(B2:B5,1)', 4.5);
+  eq('=CORREL(B2:B5,C2:C5)', -0.7544605063, 1e-8); eq('=SQRT(16)', 4); eq('=POWER(2,10)', 1024); eq('=ABS(-3)', 3); eq('=PRODUCT(2,3,4)', 24); eq('=GCD(12,18)', 6);
+  eq('=FACT(5)', 120); eq('=COMBIN(5,2)', 10); eq('=SUBTOTAL(9,B2:B6)', 40); eq('=NORM.S.DIST(1.96,TRUE)', 0.9750021, 1e-6); eq('=NORM.INV(0.975,0,1)', 1.959964, 1e-6);
+  eq('=ROMAN(2026)', 'MMXXVI'); eq('=DEC2HEX(255)', 'FF'); eq('=SLOPE({1,2,3},{1,2,3})', 1); eq('=MROUND(10,3)', 9);
+});
+t('financial', () => {
+  eq('=PMT(0.05/12,60,30000)', -566.1370, 1e-6); eq('=FV(0.06/12,10,-200,-500,1)', 2581.4034, 1e-6); eq('=PV(0.08/12,240,500)', -59777.1458, 1e-6);
+  eq('=NPV(0.1,-10000,3000,4200,6800)', 1188.4434, 1e-6); eq('=IRR({-70000,12000,15000,18000,21000,26000})', 0.086630948, 1e-6);
+  eq('=RATE(48,-200,8000)', 0.007701472, 1e-5); eq('=NPER(0.01,-100,-1000,10000,1)', 59.6738657, 1e-6); eq('=IPMT(0.1/12,1,36,8000)', -66.6667, 1e-5);
+  eq('=SLN(30000,7500,10)', 2250); eq('=EFFECT(0.0525,4)', 0.053543, 1e-5);
+});
+t('arrays & spill', () => {
+  eq('=SUM(SEQUENCE(4))', 10); eq('=ROWS(UNIQUE(E2:E6))', 3); eq('=INDEX(SORT(B2:B5,1,-1),1)', 20); eq('=COUNTA(FILTER(A2:A6,E2:E6="A"))', 2);
+  eq('=INDEX(SORTBY(A2:A5,C2:C5),1)', 'Mouse'); eq('=SUM(TAKE(B2:B6,2))', 8); eq('=COLUMNS(TRANSPOSE(A1:E1))', 1); eq('=ROWS(VSTACK(A1:B1,A2:B3))', 3);
+  eq('=INDEX(TEXTSPLIT("a,b,c",","),1,2)', 'b'); eq('=FILTER(A2:A6,B2:B6>100,"none")', 'none'); eq('=SUM(IF(B2:B5>4,C2:C5,0))', 385.89);
+  // spill into the sheet
+  const k = s1.rows[30] + ':' + s1.cols[0];
+  s1.cells[k] = { v: '=SEQUENCE(3,2)' };
+  s1.cells[s1.rows[35] + ':' + s1.cols[0]] = { v: '=SUM(A31#)' };
+  engine.invalidate();
+  results.push({ ok: engine.valueAt(s1, 32, 1) === 6, f: 'spill A33 → B33 = 6', v: engine.valueAt(s1, 32, 1), expected: 6 });
+  results.push({ ok: engine.valueAt(s1, 35, 0) === 21, f: '=SUM(A31#)', v: engine.valueAt(s1, 35, 0), expected: 21 });
+  s1.cells[s1.rows[31] + ':' + s1.cols[1]] = { v: 'block' };
+  engine.invalidate();
+  const sp = engine.valueAt(s1, 30, 0);
+  results.push({ ok: isErr(sp) && sp.code === '#SPILL!', f: 'blocked spill', v: isErr(sp) ? sp.code : sp, expected: '#SPILL!' });
+  delete s1.cells[k]; delete s1.cells[s1.rows[35] + ':' + s1.cols[0]]; delete s1.cells[s1.rows[31] + ':' + s1.cols[1]];
+});
+t('tables', () => {
+  eq('=SUM(Sales[Qty])', 40); eq('=COUNTA(Sales[Item])', 5); eq('=ROWS(Sales[#All])', 6); eq('=INDEX(Sales[#Headers],1,3)', 'Price');
+  const k = s1.rows[2] + ':' + s1.cols[5];
+  s1.cells[k] = { v: '=Sales[@Qty]*Sales[@Price]' };
+  engine.invalidate();
+  results.push({ ok: engine.valueAt(s1, 2, 5) === 1600, f: 'Sales[@Qty]*Sales[@Price] in row 3', v: engine.valueAt(s1, 2, 5), expected: 1600 });
+  delete s1.cells[k];
+});
+t('circular', () => {
+  const a = s1.rows[40] + ':' + s1.cols[0], b = s1.rows[40] + ':' + s1.cols[1];
+  s1.cells[a] = { v: '=B41+1' }; s1.cells[b] = { v: '=A41+1' };
+  engine.invalidate();
+  const v = engine.valueAt(s1, 40, 0);
+  results.push({ ok: isErr(v) && v.code === '#CIRC!', f: 'A41=B41+1, B41=A41+1', v: isErr(v) ? v.code : v, expected: '#CIRC!' });
+  delete s1.cells[a]; delete s1.cells[b];
+});
+t('rewriting', () => {
+  const chk = (got, exp, label) => results.push({ ok: got === exp, f: label, v: got, expected: exp });
+  chk(translateFormula('=A1+$B$2+C$3+$D4', 2, 1), '=B3+$B$2+D$3+$D6', 'translate');
+  chk(translateFormula('=A1', -1, 0), '=#REF!', 'translate off sheet');
+  chk(shiftFormula('=SUM(A1:A10)+B5', 'r', 4, 2, () => true), '=SUM(A1:A12)+B7', 'insert rows');
+  chk(shiftFormula('=SUM(A1:A10)+B5', 'r', 4, -1, () => true), '=SUM(A1:A9)+#REF!', 'delete row 5');
+  chk(shiftFormula('=C1+SUM(A:C)', 'c', 1, 1, () => true), '=D1+SUM(A:D)', 'insert column');
+  chk(renameSheetInFormula("=Sheet1!A1+'Data 2'!B2", 'Data 2', 'Totals'), '=Sheet1!A1+Totals!B2', 'rename sheet');
+  chk(renameSheetInFormula("=SUM('Data 2'!A1:B2)", 'Data 2', null), '=SUM(#REF!)', 'delete sheet');
+});
+t('input parsing', () => {
+  const chk = (txt, loc, raw, nf) => { const p = parseInput(txt, loc); results.push({ ok: p.raw === raw && (nf === undefined || (p.fmt && p.fmt.nf) === nf), f: `parse "${txt}" (${loc})`, v: p.raw + ' ' + (p.fmt ? p.fmt.nf : ''), expected: raw + ' ' + (nf || '') }); };
+  chk('3,5', 'tr-TR', '3.5'); chk('1.234,5', 'tr-TR', '1234.5', 'num'); chk('1,234.5', 'en-US', '1234.5', 'num'); chk('12%', 'en-US', '0.12', 'pct');
+  chk('17.11.2026', 'tr-TR', '46343', 'date'); chk('11/17/2026', 'en-US', '46343', 'date'); chk('2026-11-17', 'en-US', '46343', 'date');
+  chk('₺1.250,00', 'tr-TR', '1250', 'cur'); chk('$12.50', 'en-US', '12.5', 'cur'); chk('14:30', 'en-US', '0.6041666667', 'time'); chk('hello', 'en-US', 'hello');
+  chk('007', 'en-US', '7'); chk("'007", 'en-US', "'007");
+  const fv = (v, st, loc, exp) => results.push({ ok: formatValue(v, st, loc) === exp, f: `format ${v} ${JSON.stringify(st)} ${loc}`, v: formatValue(v, st, loc), expected: exp });
+  fv(1234.5, { nf: 'num', dp: 2 }, 'tr-TR', '1.234,50'); fv(0.125, { nf: 'pct', dp: 1 }, 'en-US', '12.5%'); fv(46343, { nf: 'date' }, 'tr-TR', '17.11.2026');
+  fv(1250, { nf: 'cur', cur: '₺', dp: 2 }, 'tr-TR', '1.250,00 ₺'); fv(1/3, null, 'en-US', '0.3333333333');
+  fv(12345678901, null, 'en-US', '12345678901'); fv(98765432109, null, 'en-US', '98765432109'); fv(123456789012, null, 'en-US', '1.23457E+11'); fv(-42, null, 'en-US', '-42');
+  results.push({ ok: formatWithPattern(-1234, '#,##0;[Red]-#,##0', 'en-US') === '-1,234', f: 'pattern negative section', v: formatWithPattern(-1234, '#,##0;[Red]-#,##0', 'en-US'), expected: '-1,234' });
+});
+t('formula separators', () => {
+  const pairs = [
+    ['=ROUND(1.5,0)', '=ROUND(1,5;0)'],
+    ['=SUMPRODUCT($C$1:$D$1,C5:D5)', '=SUMPRODUCT($C$1:$D$1;C5:D5)'],
+    ['=IF(A1>0.5,"a,b;c",\'Data 2\'!A1)', '=IF(A1>0,5;"a,b;c";\'Data 2\'!A1)'],
+    ['=SUM({1,2;3,4})+STDEV.S(B1:B3)', '=SUM({1,2;3,4})+STDEV.S(B1:B3)'],
+    ['=SUM(Sales[Qty],1.25)', '=SUM(Sales[Qty];1,25)'],
+    ['=A1*1E+3', '=A1*1E+3']
+  ];
+  for (const [stored, local] of pairs) {
+    const shown = formulaToLocal(stored, 'semicolon');
+    results.push({ ok: shown === local, f: 'to local ' + stored, v: shown, expected: local });
+    const back = formulaFromLocal(local, 'semicolon');
+    results.push({ ok: back === stored, f: 'from local ' + local, v: back, expected: stored });
+  }
+  // typed with commas in semicolon style: kept as separators, except a decimal comma after a number
+  const t1 = formulaFromLocal('=SUM(A1,B1)', 'semicolon');
+  results.push({ ok: t1 === '=SUM(A1,B1)', f: 'comma after a reference stays a separator', v: t1, expected: '=SUM(A1,B1)' });
+  const t2 = formulaToLocal('=SUM(A1;B1)', 'comma');
+  results.push({ ok: t2 === '=SUM(A1,B1)', f: 'comma style shows commas', v: t2, expected: '=SUM(A1,B1)' });
+  results.push({ ok: separatorStyle('auto', 'tr-TR') === 'semicolon' && separatorStyle('auto', 'en-US') === 'comma' && separatorStyle('comma', 'tr-TR') === 'comma', f: 'separator style by language', v: separatorStyle('auto', 'tr-TR'), expected: 'semicolon' });
+  results.push({ ok: helpToLocal('ROUND(number, digits)', 'semicolon') === 'ROUND(number; digits)', f: 'help in semicolon style', v: helpToLocal('ROUND(number, digits)', 'semicolon'), expected: 'ROUND(number; digits)' });
+  // the stored form evaluates as typed in the local style
+  const v = ev(formulaFromLocal('=ROUND(1,5;0)+SUM(1,25;2)', 'semicolon'));
+  results.push({ ok: v === 5.25, f: 'local formula evaluates', v, expected: 5.25 });
+});
+t('fill series', () => {
+  const sh = Core.newSheet('F', 20, 4);
+  const set = (r, c, v) => { sh.cells[sh.rows[r] + ':' + sh.cols[c]] = { v }; };
+  set(0, 0, '1'); set(1, 0, '3'); set(0, 1, 'Mon'); set(0, 2, 'Item 9'); set(0, 3, '=A1*2');
+  const ops = M.fillOps(sh, { r1: 0, c1: 0, r2: 1, c2: 0 }, { r1: 2, c1: 0, r2: 3, c2: 0 }, 'down').concat(
+    M.fillOps(sh, { r1: 0, c1: 1, r2: 0, c2: 3 }, { r1: 1, c1: 1, r2: 2, c2: 3 }, 'down'));
+  const v = (r, c) => (ops.find((o) => o.k === sh.rows[r] + ':' + sh.cols[c]) || {}).v;
+  const chk = (got, exp, label) => results.push({ ok: got === exp, f: label, v: got, expected: exp });
+  chk(v(2, 0), '5', 'series 1,3 → 5'); chk(v(3, 0), '7', 'series → 7'); chk(v(2, 1), 'Wed', 'Mon → Wed'); chk(v(1, 2), 'Item 10', 'Item 9 → Item 10'); chk(v(2, 3), '=A3*2', 'formula fill');
+});
+
+t('hidden rows (SUBTOTAL, AGGREGATE)', () => {
+  // B2:B6 = 3, 5, 12, 20, empty; row 3 (Monitor, 5) filtered out, row 4 (Keyboard, 12) hidden by hand
+  book.hidden[s1.id + '|2'] = 'filter';
+  book.hidden[s1.id + '|3'] = 'manual';
+  eq('=SUBTOTAL(9,B2:B6)', 35);      // leaves out filtered rows only
+  eq('=SUBTOTAL(109,B2:B6)', 23);    // also leaves out the hidden row
+  eq('=SUBTOTAL(103,A2:A6)', 3);
+  eq('=AGGREGATE(9,5,B2:B6)', 23);
+  eq('=AGGREGATE(9,4,B2:B6)', 40);
+  eq('=AGGREGATE(14,5,B2:B6,1)', 20);
+  eq('=SUM(B2:B6)', 40);
+  book.hidden = {};
+  // nested subtotals are not counted twice
+  const k = s1.rows[6] + ':' + s1.cols[1];
+  s1.cells[k] = { v: '=SUBTOTAL(9,B2:B6)' };
+  eq('=SUBTOTAL(9,B2:B7)', 40);
+  delete s1.cells[k];
+});
+t('links', () => {
+  const k = s1.rows[50] + ':' + s1.cols[0];
+  s1.cells[k] = { v: '=HYPERLINK("javascript:alert(1)","bad")' };
+  s1.cells[s1.rows[51] + ':' + s1.cols[0]] = { v: '=HYPERLINK("https://www.jetbrains.com","ok")' };
+  engine.invalidate();
+  engine.valueAt(s1, 50, 0); engine.valueAt(s1, 51, 0);
+  results.push({ ok: engine.linkAt(s1, 50, 0) === null, f: 'javascript: link refused', v: engine.linkAt(s1, 50, 0), expected: null });
+  results.push({ ok: engine.linkAt(s1, 51, 0) === 'https://www.jetbrains.com', f: 'https link kept', v: engine.linkAt(s1, 51, 0), expected: 'https://www.jetbrains.com' });
+  delete s1.cells[k]; delete s1.cells[s1.rows[51] + ':' + s1.cols[0]];
+});
+try {
+  const IO = await import('./io.js');
+  engine.invalidate();
+  const chk = (f, exp, at = [10, 9]) => { const got = IO.exportFormula(engine, f, s1, at[0], at[1]); results.push({ ok: got === exp, f: 'export ' + f, v: got, expected: exp }); };
+  chk('XLOOKUP(A2,A2:A6,C2:C6)', '_xlfn.XLOOKUP(A2,A2:A6,C2:C6)');
+  chk('SUM(FILTER(B2:B6,B2:B6>4))', 'SUM(_xlfn._xlws.FILTER(B2:B6,B2:B6>4))');
+  chk('LET(x,2,x*B2)', '_xlfn.LET(_xlpm.x,2,_xlpm.x*B2)');
+  chk('SUM(Sales[Qty])', 'SUM($B$2:$B$6)');
+  chk('SUM(A1#)+MUNIT(2)', 'SUM(_xlfn.ANCHORARRAY(A1))+_xlfn.MUNIT(2)');
+  chk('Sales[@Qty]*2', 'B4*2', [3, 9]);
+  chk('SUMPRODUCT($C$1:$D$1;C5:D5)+IF(B2>0;1;SUM({1,2;3,4}))', 'SUMPRODUCT($C$1:$D$1,C5:D5)+IF(B2>0,1,SUM({1,2;3,4}))');
+  chk("SUM('Data 2'!A1:B2)+VLOOKUP(\"x\",A:B,2,FALSE)", "SUM('Data 2'!A1:B2)+VLOOKUP(\"x\",A:B,2,FALSE)");
+} catch (e) { results.push({ ok: false, f: 'exportFormula', v: 'threw ' + e.message, expected: '' }); }
+
+try {
+  const IO = await import('./io.js');
+  const sh = Core.newSheet('C', 5, 3);
+  sh.cells[sh.rows[0] + ':' + sh.cols[0]] = { v: '1.5' };
+  sh.cells[sh.rows[0] + ':' + sh.cols[1]] = { v: 'a;b' };
+  sh.cells[sh.rows[0] + ':' + sh.cols[2]] = { v: 'x,y' };
+  const eng = new Engine({ sheets: [sh], names: {} }, 'en-US');
+  const read = async (o) => (await IO.writeCsv(eng, sh, 'en-US', o).text()).replace(/^\uFEFF/, '');
+  const semi = await read({ delim: ';', dec: ',' }), comma = await read({ delim: ',', dec: '.' }), tab = await read({ delim: '\t', dec: '.' });
+  results.push({ ok: semi === '1,5;"a;b";x,y', f: 'csv semicolon', v: semi, expected: '1,5;"a;b";x,y' });
+  results.push({ ok: comma === '1.5,a;b,"x,y"', f: 'csv comma', v: comma, expected: '1.5,a;b,"x,y"' });
+  results.push({ ok: tab === '1.5\ta;b\tx,y', f: 'csv tab', v: tab, expected: '1.5\ta;b\tx,y' });
+} catch (e) { results.push({ ok: false, f: 'csv separators', v: 'threw ' + e.message, expected: '' }); }
+
+// XLSX round trip: write the workbook, read it back
+try {
+  const IO = await import('./io.js');
+  s1.cells[s1.rows[1] + ':' + s1.cols[2]].st = { nf: 'cur', cur: '₺', dp: 2, b: 1, bg: '#fff2cc' };
+  s1.cells[s1.rows[6] + ':' + s1.cols[1]] = { v: '=SUM(B2:B6)' };
+  s1.merges = [{ r1: s1.rows[8], c1: s1.cols[0], r2: s1.rows[8], c2: s1.cols[2] }];
+  s1.freeze = { r: 1, c: 0 };
+  engine.invalidate();
+  const blob = await IO.writeXlsx(doc, engine, 99);
+  const back = await IO.readXlsx(await blob.arrayBuffer(), { translate: translateFormula });
+  const sheets = IO.toSheets(back);
+  const a = sheets[0];
+  const get = (r, c) => a.cells[a.rows[r] + ':' + a.cols[c]];
+  const chk = (got, exp, label) => results.push({ ok: JSON.stringify(got) === JSON.stringify(exp), f: 'xlsx ' + label, v: got, expected: exp });
+  chk(sheets.map((s) => s.name), ['Sheet1', 'Data 2'], 'sheet names');
+  chk(get(0, 0).v, 'Item', 'text');
+  chk(get(1, 2).v, '1250.5', 'number');
+  chk(get(1, 2).st.nf + get(1, 2).st.b + get(1, 2).st.bg, 'cur1#fff2cc', 'style');
+  chk(get(6, 1).v, '=SUM(B2:B6)', 'formula');
+  chk(a.merges.length, 1, 'merge');
+  chk(a.freeze, { r: 1, c: 0 }, 'freeze');
+  chk(back.names.RATE, '=0.18', 'defined name');
+  chk(a.tables.length, 0, 'tables are exported as ranges');
+} catch (e) { results.push({ ok: false, f: 'xlsx round trip', v: 'threw ' + e.message, expected: '' }); }
+
+// ---------------------------------------------------------------- Solver engines (known optima)
+try {
+  const SV = await import('./solver.js');
+  const { seekRoot } = await import('./whatif.js');
+  const close = (got, exp, label, tol = 1e-4) => {
+    const ok = Array.isArray(exp) ? Array.isArray(got) && got.length === exp.length && got.every((v, i) => Math.abs(v - exp[i]) <= tol * Math.max(1, Math.abs(exp[i])))
+      : Math.abs(got - exp) <= tol * Math.max(1, Math.abs(exp));
+    results.push({ ok, f: 'solver ' + label, v: got, expected: exp });
+  };
+  const same = (got, exp, label) => results.push({ ok: JSON.stringify(got) === JSON.stringify(exp), f: 'solver ' + label, v: got, expected: exp });
+  const P = (o) => ({ x0: new Array(o.n).fill(0), lb: new Array(o.n).fill(0), ub: new Array(o.n).fill(Infinity), isInt: new Array(o.n).fill(false), difGroups: [], sense: 1, ctype: [], ...o });
+  const opt = { ...SV.DEFAULT_OPTIONS, intTolerance: 0 };
+
+  // Wyndor Glass (Hillier & Lieberman): max 3x + 5y, x ≤ 4, 2y ≤ 12, 3x + 2y ≤ 18 → (2, 6), z = 36
+  const wy = P({ n: 2, sense: -1, ctype: ['le', 'le', 'le'], evaluate: (x) => ({ f: 3 * x[0] + 5 * x[1], g: [x[0] - 4, 2 * x[1] - 12, 3 * x[0] + 2 * x[1] - 18] }) });
+  let r = await SV.simplexLP(wy, opt);
+  same(r.status, 'found', 'LP status'); close(r.x, [2, 6], 'LP optimum');
+  close(r.sensitivity.gDuals.map((d) => -d), [0, 1.5, 1], 'LP shadow prices');
+  close(r.sensitivity.gRange[1], [6, 6], 'LP RHS ranging');
+  close(r.sensitivity.costRange[0], [4.5, 3], 'LP cost ranging (as minimization)');
+  const lim = SV.variableLimits(wy, r.x, r.linear);
+  close([lim[0].lower, lim[0].objLower, lim[0].upper, lim[0].objUpper], [0, 30, 2, 36], 'limits');
+  // equalities: x + 2y = 4, 3x + y = 7 → (2, 1)
+  r = await SV.simplexLP(P({ n: 2, ctype: ['eq', 'eq'], evaluate: (x) => ({ f: x[0] + x[1], g: [x[0] + 2 * x[1] - 4, 3 * x[0] + x[1] - 7] }) }), opt);
+  close(r.x, [2, 1], 'LP equalities');
+  // free variable with a lower bound below zero
+  r = await SV.simplexLP(P({ n: 1, lb: [-5], evaluate: (x) => ({ f: x[0], g: [] }) }), opt);
+  close(r.x, [-5], 'LP negative bound');
+  // Beale's cycling example: max .75x1 − 20x2 + .5x3 − 6x4 → 1.25
+  r = await SV.simplexLP(P({ n: 4, sense: -1, ctype: ['le', 'le', 'le'], evaluate: (x) => ({ f: 0.75 * x[0] - 20 * x[1] + 0.5 * x[2] - 6 * x[3], g: [0.25 * x[0] - 8 * x[1] - x[2] + 9 * x[3], 0.5 * x[0] - 12 * x[1] - 0.5 * x[2] + 3 * x[3], x[2] - 1] }) }), opt);
+  close(0.75 * r.x[0] - 20 * r.x[1] + 0.5 * r.x[2] - 6 * r.x[3], 1.25, 'LP degenerate (no cycling)');
+  same((await SV.simplexLP(P({ n: 1, ctype: ['ge', 'le'], evaluate: (x) => ({ f: x[0], g: [x[0] - 5, x[0] - 3] }) }), opt)).status, 'infeasible', 'LP infeasible');
+  same((await SV.simplexLP(P({ n: 1, sense: -1, evaluate: (x) => ({ f: x[0], g: [] }) }), opt)).status, 'unbounded', 'LP unbounded');
+  same((await SV.simplexLP(P({ n: 1, lb: [-Infinity], evaluate: (x) => ({ f: x[0] * x[0], g: [] }) }), opt)).status, 'linearity', 'LP linearity check');
+  // integer: max 5x + 4y, 6x + 4y ≤ 24, x + 2y ≤ 6 → (4, 0)
+  const ip = P({ n: 2, sense: -1, isInt: [true, true], ctype: ['le', 'le'], evaluate: (x) => ({ f: 5 * x[0] + 4 * x[1], g: [6 * x[0] + 4 * x[1] - 24, x[0] + 2 * x[1] - 6] }) });
+  close((await SV.simplexLP(ip, opt)).x, [4, 0], 'integer (LP)');
+  close((await SV.grg(ip, opt)).x, [4, 0], 'integer (GRG)');
+  // binary knapsack → a, c, d
+  r = await SV.simplexLP(P({ n: 4, sense: -1, ub: [1, 1, 1, 1], isInt: [true, true, true, true], ctype: ['le'], evaluate: (x) => ({ f: 10 * x[0] + 13 * x[1] + 7 * x[2] + 8 * x[3], g: [4 * x[0] + 6 * x[1] + 3 * x[2] + 5 * x[3] - 12] }) }), opt);
+  close(r.x, [1, 0, 1, 1], 'binary knapsack');
+  // AllDifferent: min Σ c·x with x a permutation of 1..5 → largest values on the smallest costs
+  const c5 = [5, 1, 4, 2, 3];
+  const dif = P({ n: 5, lb: [1, 1, 1, 1, 1], ub: [5, 5, 5, 5, 5], isInt: [true, true, true, true, true], difGroups: [[0, 1, 2, 3, 4]], evaluate: (x) => ({ f: x.reduce((s, v, i) => s + c5[i] * v, 0), g: [] }) });
+  close((await SV.simplexLP(dif, opt)).x, [1, 5, 2, 4, 3], 'AllDifferent (LP)');
+  close((await SV.evolutionary(dif, { ...opt, seed: 9, maxNoImprove: 3 })).x, [1, 5, 2, 4, 3], 'AllDifferent (Evolutionary)');
+  // nonlinear with an active constraint: min (x−1)² + (y−2)², x + y ≤ 2 → (0.5, 1.5), multiplier −1
+  r = await SV.grg(P({ n: 2, lb: [-Infinity, -Infinity], ctype: ['le'], evaluate: (x) => ({ f: (x[0] - 1) ** 2 + (x[1] - 2) ** 2, g: [x[0] + x[1] - 2] }) }), opt);
+  close(r.x, [0.5, 1.5], 'GRG constrained', 1e-5); close(r.sensitivity.multipliers[0], -1, 'GRG Lagrange multiplier', 1e-4);
+  r = await SV.grg(P({ n: 2, lb: [-Infinity, -Infinity], ctype: ['eq'], evaluate: (x) => ({ f: x[0] ** 2 + x[1] ** 2, g: [x[0] + x[1] - 1] }) }), opt);
+  close(r.x, [0.5, 0.5], 'GRG equality', 1e-5);
+  r = await SV.grg(P({ n: 2, x0: [-1.2, 1], lb: [-Infinity, -Infinity], evaluate: (x) => ({ f: 100 * (x[1] - x[0] ** 2) ** 2 + (1 - x[0]) ** 2, g: [] }) }), opt);
+  close(r.x, [1, 1], 'GRG Rosenbrock', 1e-3);
+  r = await SV.grg(P({ n: 1, x0: [3], lb: [2.7], ub: [7.5], evaluate: (x) => ({ f: Math.sin(x[0]) + Math.sin(10 * x[0] / 3), g: [] }) }), { ...opt, multistart: true, population: 20, seed: 3 });
+  close(r.x, [5.145735], 'GRG Multistart global optimum', 1e-4); same(r.status, 'global', 'Multistart status');
+  same((await SV.grg(P({ n: 1, lb: [-Infinity], evaluate: (x) => ({ f: x[0], g: [] }) }), { ...opt, multistart: true })).status, 'bounds', 'Multistart requires bounds');
+  r = await SV.evolutionary(P({ n: 2, lb: [-10, -10], ub: [10, 10], evaluate: (x) => ({ f: Math.abs(x[0] - 3) + Math.abs(x[1] + 1), g: [] }) }), { ...opt, seed: 7, maxNoImprove: 3 });
+  close(r.x, [3, -1], 'Evolutionary non-smooth', 1e-3);
+  // regression: infeasibility must not hide behind one large right side (x ≤ 1e8, x ≥ 3, x ≤ 1)
+  same((await SV.simplexLP(P({ n: 1, sense: -1, ctype: ['le', 'ge', 'le'], evaluate: (x) => ({ f: x[0], g: [x[0] - 1e8, x[0] - 3, x[0] - 1] }) }), opt)).status, 'infeasible', 'LP infeasible with a large right side');
+  // regression: redundant equal rows (x + y = 2 twice, 2x + 2y = 4) are not a reason to fail
+  r = await SV.simplexLP(P({ n: 2, ctype: ['eq', 'eq', 'eq'], evaluate: (x) => ({ f: x[0], g: [x[0] + x[1] - 2, x[0] + x[1] - 2, 2 * x[0] + 2 * x[1] - 4] }) }), opt);
+  same(r.status, 'found', 'LP redundant rows'); close(r.x, [0, 2], 'LP redundant rows optimum');
+  // regression: free variable ranging (Max x, x ≤ 4, x free): user increase 1E+30, decrease 1 → as minimization [1E+30, 1]
+  r = await SV.simplexLP(P({ n: 1, sense: -1, lb: [-Infinity], ctype: ['le'], evaluate: (x) => ({ f: x[0], g: [x[0] - 4] }) }), opt);
+  close(r.x, [4], 'LP free variable'); close(r.sensitivity.costRange[0], [1e30, 1], 'LP free variable cost ranging');
+  // free variable that ends up negative (Min x, x ≥ −3): the basic column is the mirrored twin
+  r = await SV.simplexLP(P({ n: 1, lb: [-Infinity], ctype: ['ge'], evaluate: (x) => ({ f: x[0], g: [x[0] + 3] }) }), opt);
+  close(r.x, [-3], 'LP free variable negative'); close(r.sensitivity.costRange[0], [1, 1e30], 'LP negative free variable ranging');
+  // GRG: constraints are measured relative to their size (x + y = 1e6) and infeasible models are reported as such
+  r = await SV.grg(P({ n: 2, lb: [-Infinity, -Infinity], ctype: ['eq'], evaluate: (x) => ({ f: (x[0] - 1) ** 2 + (x[1] - 1) ** 2, g: [x[0] + x[1] - 1e6], lhs: [x[0] + x[1]] }) }), opt);
+  close(r.x, [5e5, 5e5], 'GRG large equality', 1e-6);
+  same((await SV.grg(P({ n: 1, lb: [-Infinity], ctype: ['ge', 'le'], evaluate: (x) => ({ f: x[0] ** 2, g: [x[0] - 1, x[0] - 0.5] }) }), opt)).status, 'infeasible', 'GRG infeasible');
+  // second review: dependent equality rows with large right sides (coefficients must not pick up round-off)
+  const blend = (c, a, total, sh) => P({ n: 4, ctype: ['eq', 'eq', 'eq'], evaluate: (x) => {
+    const r1 = a.reduce((s, v, i) => s + v * x[i], 0), r2 = a.reduce((s, v, i) => s + (1 - v) * x[i], 0), r3 = x.reduce((s, v) => s + v, 0);
+    const lhs = [r1, r2, r3], rhs = [sh * total, (1 - sh) * total, total];
+    return { f: c.reduce((s, v, i) => s + v * x[i], 0), g: lhs.map((l, k) => l - rhs[k]), lhs, rhs };
+  } });
+  r = await SV.simplexLP(blend([4, 4, 1, 4], [0.1, 0.78, 0.93, 0.61], 1e8, 0.27), opt);
+  same(r.status, 'found', 'LP dependent rows, large right sides: status');
+  close(4 * r.x[0] + 4 * r.x[1] + r.x[2] + 4 * r.x[3], 338554216.867, 'LP dependent rows, large right sides: optimum', 1e-7);
+  r = await SV.simplexLP(blend([6, 7, 5, 9], [0.69, 0.77, 0.22, 0.62], 1e8, 0.25), opt);
+  close(6 * r.x[0] + 7 * r.x[1] + 5 * r.x[2] + 9 * r.x[3], 506382978.72, 'LP dependent rows: not a worse vertex', 1e-7);
+  // GRG must not stop while a multiplier sits on a slack row: Min 3x + 2y, x + y ≥ 10, start (50, 50) → (0, 10)
+  r = await SV.grg(P({ n: 2, x0: [50, 50], ctype: ['ge'], evaluate: (x) => ({ f: 3 * x[0] + 2 * x[1], g: [x[0] + x[1] - 10], lhs: [x[0] + x[1]], rhs: [10] }) }), opt);
+  close(r.x, [0, 10], 'GRG complementarity', 1e-5);
+  r = await SV.grg(P({ n: 3, x0: [8, 19, 18], ub: [20, 20, 20], ctype: ['ge'], evaluate: (x) => ({ f: 6 * x[0] + x[1] + x[2], g: [2 * x[0] + x[1] + 4 * x[2] - 25] }) }), opt);
+  close(6 * r.x[0] + r.x[1] + r.x[2], 6.25, 'GRG complementarity 3 variables', 1e-5);
+  // Integer Optimality is relative also for objectives below 1 (default 1%)
+  r = await SV.simplexLP(P({ n: 2, sense: -1, ub: [1, 1], isInt: [true, true], ctype: ['le'], evaluate: (x) => ({ f: 0.003 * x[0] + 0.002 * x[1], g: [x[0] + x[1] - 1.5] }) }), { ...SV.DEFAULT_OPTIONS });
+  close(r.x, [1, 0], 'integer optimality is relative');
+  // Evolutionary keeps the bounds of AllDifferent members (A1 = 1) and the 1..N meaning
+  r = await SV.evolutionary(P({ n: 4, x0: [1, 2, 3, 4], lb: [1, 1, 1, 1], ub: [1, 4, 4, 4], isInt: [true, true, true, true], difGroups: [[0, 1, 2, 3]], evaluate: (x) => ({ f: -10 * x[0] + x[1] + 2 * x[2] + 3 * x[3], g: [] }) }), { ...opt, seed: 4, maxNoImprove: 2 });
+  close(r.x, [1, 4, 3, 2], 'Evolutionary AllDifferent with a bound');
+  r = await SV.evolutionary(P({ n: 3, x0: [0, 1, 2], lb: [1, 1, 1], ub: [3, 3, 3], isInt: [true, true, true], difGroups: [[0, 1, 2]], evaluate: (x) => ({ f: x[0] + x[1] + x[2], g: [] }) }), { ...opt, seed: 4, maxNoImprove: 2 });
+  same(r.x.slice().sort(), [1, 2, 3], 'Evolutionary AllDifferent start outside 1..N');
+  same((await SV.evolutionary(P({ n: 1, lb: [2], ub: [1], evaluate: (x) => ({ f: x[0], g: [] }) }), opt)).status, 'infeasible', 'Evolutionary conflicting bounds');
+  // GRG scaling: tiny objectives and constraint rows in small units
+  r = await SV.grg(P({ n: 2, lb: [-Infinity, -Infinity], evaluate: (x) => ({ f: 1e-8 * ((x[0] - 3) ** 2 + (x[1] + 1) ** 2), g: [] }) }), opt);
+  close(r.x, [3, -1], 'GRG tiny objective', 1e-4);
+  const S3 = [[0.04, 0.006, 0.002], [0.006, 0.01, 0.001], [0.002, 0.001, 0.0025]].map((row) => row.map((v) => v / 250)), mu3 = [0.12, 0.08, 0.05].map((v) => v / 250);
+  r = await SV.grg(P({ n: 3, x0: [1 / 3, 1 / 3, 1 / 3], ctype: ['eq', 'ge'], evaluate: (w) => {
+    let v = 0; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) v += w[i] * S3[i][j] * w[j];
+    const lhs = [w[0] + w[1] + w[2], mu3.reduce((s, m, i) => s + m * w[i], 0)], rhs = [1, 0.08 / 250];
+    return { f: v, g: lhs.map((l, k) => l - rhs[k]), lhs, rhs };
+  } }), opt);
+  close(r.x, [0.2285, 0.4669, 0.3046], 'GRG Markowitz in daily units', 2e-3);
+  same((await SV.grg(P({ n: 1, lb: [-Infinity], sense: -1, evaluate: (x) => ({ f: x[0], g: [] }) }), opt)).status, 'unbounded', 'GRG unbounded');
+  // Goal Seek root finding
+  close((await seekRoot((x) => x ** 3 + x - 10, 1)).x, 2, 'Goal Seek cubic', 1e-9);
+  close((await seekRoot((x) => Math.exp(x) - 100, 0)).x, Math.log(100), 'Goal Seek exp', 1e-9);
+} catch (e) { results.push({ ok: false, f: 'solver tests', v: 'threw ' + e.message + ' ' + e.stack, expected: '' }); }
+
+const fails = results.filter((r) => !r.ok);
+document.getElementById('sum').innerHTML = `<b class="${fails.length ? 'fail' : 'ok'}">${results.length - fails.length} / ${results.length} passed</b>`;
+document.getElementById('out').textContent = fails.map((r) => `FAIL ${r.f}\n   got ${JSON.stringify(r.v)}  expected ${JSON.stringify(r.expected)}`).join('\n');
+window.__results = { total: results.length, fails };
+</script>
+</body>
+</html>

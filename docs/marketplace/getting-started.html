@@ -1,0 +1,48 @@
+<p>Spreadsheets for YouTrack needs YouTrack 2026.2 or later. An administrator sets it up once for each project. After that, people open spreadsheets from the issues of those projects.</p>
+<h3>Set up (administrators)</h3>
+<ol>
+<li><b>Install the app.</b> Click <b>Install</b> on this page and enter the address of your YouTrack, or go to <b>Administration &gt; Apps</b> in YouTrack and click <b>Add app</b>.</li>
+<li><b>Attach it to projects.</b> In <b>Administration &gt; Apps</b>, open <b>Spreadsheets for YouTrack</b>, go to <b>Projects</b> and click <b>Manage projects</b>. Select the projects that should have spreadsheets. The Spreadsheet section and the <b>Open spreadsheet</b> menu item appear only in issues of these projects.</li>
+<li><b>Choose who can edit (optional).</b> By default, users with the <b>Update Issue</b> permission in the project can create and edit spreadsheets, whichever role grants it (global, project or custom roles), and users who can only read an issue can view its spreadsheet. To change this for a project, open the project's settings, go to <b>Apps</b>, select <b>Spreadsheets for YouTrack</b> and open its <b>Settings</b> tab. There you can choose <b>Groups that can edit spreadsheets</b> (members edit even without Update Issue), <b>Groups that can only view spreadsheets</b> (members never edit) and <b>Everyone who can see the issue can edit</b>. Click <b>Save</b>. You need permission to update the project. The settings apply to one project at a time.</li>
+</ol>
+<h3>First use</h3>
+<ol start="4">
+<li><b>Open an issue</b> in an attached project. The <b>Spreadsheet</b> section is above the activity stream. If it is collapsed, click its header.</li>
+<li><b>Create or import a spreadsheet.</b> Click <b>Create spreadsheet</b> for an empty spreadsheet, or <b>Import .xlsx or .csv file…</b> to start from an .xlsx, .csv, .tsv or .txt file. You can also drop the file on the section. Users without edit rights see "No spreadsheet yet" instead.</li>
+<li><b>Enter data and formulas.</b> Type a value, or a formula that starts with <code>=</code>, and press Enter or Tab to save the cell. Other people who have the spreadsheet expanded, or open in the large window, see the change within a few seconds.</li>
+<li><b>Structure the data.</b> Select a range and choose <b>Data &gt; Format as table…</b> for a header row, a total row and filter buttons. Use <b>Insert &gt; Checkbox</b>, <b>Insert &gt; Dropdown list</b>, <b>Format &gt; Conditional formatting…</b> and <b>Insert &gt; Chart</b> for checklists, status columns, highlights and charts.</li>
+<li><b>Open the large window.</b> In the issue's options menu, choose <b>Open spreadsheet</b>.</li>
+</ol>
+<h3>Everyday tasks</h3>
+<ul>
+<li><b>Collapse or expand:</b> click the header of the <b>Spreadsheet</b> section. YouTrack remembers your choice, and a collapsed section loads nothing.</li>
+<li><b>Change the height:</b> drag the handle under the grid, or double-click it to reset. Height and zoom apply to all issues you open in this browser.</li>
+<li><b>Show amounts in a currency:</b> choose <b>Format &gt; Number &gt; Currency</b> and pick a symbol. The currency button on the toolbar uses the currency of your YouTrack or browser locale when the app knows it, and $ otherwise. Its tooltip shows the symbol, for example Currency (€).</li>
+<li><b>See and restore changes:</b> choose <b>Change history</b> in the bar's <b>⋯</b> menu, or <b>View &gt; Change history</b>. On an entry that changed cell values, click <b>Restore these values</b> to put the old values and formats back as a new change. The button is shown only to users who can edit. It is not offered for changes to rows, columns or sheets, or for entries that changed more than 60 cells.</li>
+<li><b>Find the best values with Solver:</b> choose <b>Data &gt; Solver…</b>. Enter the objective cell and choose <b>Max</b>, <b>Min</b> or <b>Value Of</b>, enter the variable cells, click <b>Add</b> for each constraint, select a solving method and click <b>Solve</b>. The button next to a reference field lets you select the cells on the sheet. In <b>Solver Results</b>, keep the solution or restore the original values, and select reports to add them as new sheets. The model is saved with the sheet.</li>
+<li><b>Try values with Goal Seek and scenarios:</b> <b>Data &gt; What-if analysis &gt; Goal Seek…</b> finds the value of one cell that makes a formula reach a target. <b>Scenario Manager…</b> saves sets of values for up to 32 cells, shows them on the sheet and compares them in a summary sheet.</li>
+<li><b>Use semicolons in formulas:</b> if your language writes decimals with a comma (1,5), formulas use ; between arguments and , in numbers, for example =ROUND(1,5; 0). To change this, choose <b>View &gt; Formula separators</b> (also in <b>More tools</b>, the <b>⋯</b> button at the end of the toolbar) and pick <b>Automatic</b>, <b>Comma</b> or <b>Semicolon</b>. The choice applies only to you, in this browser; formulas are stored in one form, so everyone sees them in their own style and downloaded .xlsx files are correct.</li>
+<li><b>Download:</b> in the bar's <b>⋯</b> menu, choose <b>Download as .xlsx</b> for the whole spreadsheet, or <b>Download sheet as CSV</b> for the current sheet. For a CSV file you choose the separator between values (comma, semicolon or tab) and the decimal separator of numbers. The same items are in the <b>Data</b> menu.</li>
+<li><b>Delete the spreadsheet:</b> in the bar's <b>⋯</b> menu, choose <b>Delete spreadsheet…</b> and confirm. This deletes all sheets and the change history of the issue and cannot be undone. Download a copy first if you may need it.</li>
+</ul>
+<p>Users with view-only access see a <b>View only</b> tag in the bar ("You can see this spreadsheet but not edit it.") and no editing controls. They can still search, copy, open the change history and download.</p>
+<h3>Where to find things</h3>
+<ul>
+<li><b>Edit:</b> Undo, Redo, Cut, Copy, Paste, Paste special, Find and replace, Fill down, Fill right, and deleting values, rows, columns and notes.</li>
+<li><b>View:</b> Freeze, Gridlines, Show formulas, hidden rows and columns, Zoom, Change history.</li>
+<li><b>Insert:</b> rows, columns, Sheet, Table, Chart, Function, Link, Note, Checkbox, Dropdown list, Today's date.</li>
+<li><b>Format:</b> Number, Text, Alignment, Wrap text, Borders, Merge cells, Conditional formatting…, Table style…, column width and row height, Clear formatting.</li>
+<li><b>Data:</b> Sort A → Z, Sort Z → A, Sort range…, Filter, Format as table…, Remove duplicates…, Split text to columns…, Data validation…, Named ranges…, What-if analysis (Scenario Manager, Goal Seek), Solver…, import and download.</li>
+</ul>
+<h3>Keyboard shortcuts</h3>
+<ul>
+<li><b>Move and select:</b> arrow keys; Ctrl+arrow to jump to the edge of the data; Shift to extend the selection; Ctrl+A to select the data region, and Ctrl+A again to select the whole sheet.</li>
+<li><b>Edit:</b> type, double-click a cell or press F2 to edit; Enter or Tab to save and move (add Shift to go back); Alt+Enter for a new line in a cell; Ctrl+Enter to fill the selection; Esc to cancel; F4 to switch a reference between relative and absolute.</li>
+<li><b>Clipboard and undo:</b> Ctrl+C, Ctrl+X and Ctrl+V to copy, cut and paste; Ctrl+Shift+V to paste values only; Ctrl+Z and Ctrl+Y to undo and redo.</li>
+<li><b>Format:</b> Ctrl+B, Ctrl+I, Ctrl+U and Ctrl+5 for bold, italic, underline and strikethrough.</li>
+<li><b>Data:</b> Ctrl+D and Ctrl+R to fill down and right; Alt+= for AutoSum; Ctrl+Shift+L to filter; Alt+Down to open a dropdown list; Ctrl+F and Ctrl+H to find and replace.</li>
+<li><b>Insert:</b> Ctrl+K for a link; Shift+F2 for a note; Ctrl+; for today's date; Ctrl+Shift+; for the current time.</li>
+<li><b>View:</b> Ctrl+` to show or hide formulas; Alt+PageUp and Alt+PageDown to go to the previous or next sheet.</li>
+</ul>
+<h3>Before you remove the app</h3>
+<p>Spreadsheets are stored in the app's extension properties. Download the spreadsheets you want to keep with <b>Download as .xlsx</b> before you remove the app.</p>

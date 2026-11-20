@@ -1,0 +1,79 @@
+<p>A shared spreadsheet in YouTrack issues. Keep estimates, budgets, test matrices and release checklists in the issue they belong to, and edit them together with the people working on it. It is for teams that plan, test and release work in YouTrack and need a table next to the issue instead of a separate file.</p>
+<p>Each issue in a project that the app is attached to can have one spreadsheet with several sheets. It appears in a <b>Spreadsheet</b> section above the issue's activity stream, which you collapse and expand with its header like other issue sections. A bar above the grid shows the number of sheets, who edited last and when, who else has the spreadsheet open, and whether your changes are saved. <b>Open spreadsheet</b> in the issue's options menu shows the same spreadsheet in a large window.</p>
+
+<h2>How it fits into YouTrack</h2>
+<ul>
+<li><b>Uses YouTrack permissions.</b> People who can see the issue can view its spreadsheet. People with the <b>Update Issue</b> permission in the issue's project can create and edit it, whichever role grants that permission (global, project or custom roles); the app never looks at role names. People who can only read the issue get a view-only spreadsheet, and restrictions on who can see an issue apply too. In the project's app settings you can let groups edit without Update Issue, make groups view-only, or let everyone who can see the issue edit. An open spreadsheet follows permission changes within seconds, without reloading the page.</li>
+<li><b>Data stays in YouTrack.</b> Each spreadsheet is stored on its issue. The app calls only its own endpoints inside YouTrack, sends no data to external services and loads nothing from the internet.</li>
+<li><b>Opens and closes like other issue sections.</b> Collapse the <b>Spreadsheet</b> section with its header, and YouTrack remembers your choice. A collapsed section loads nothing. On an issue without a spreadsheet, the section shows one short line with <b>Create spreadsheet</b> and <b>Import file…</b>.</li>
+<li><b>Looks like YouTrack.</b> Buttons, dropdowns, dialogs, menus, tabs and notifications follow Ring UI, the design system of YouTrack, and the app switches between light and dark with the YouTrack theme. Cell colors that users pick stay readable in the dark theme.</li>
+<li><b>No comments or notifications.</b> The app does not add comments or send notifications for spreadsheet edits. Edits are recorded in the app's own change history.</li>
+</ul>
+
+<h2>What you can use it for</h2>
+<ul>
+<li><b>Estimates and budgets.</b> List items with quantity and unit price, total them with formulas, format amounts as currency and show the amounts per category in a chart. The estimate stays next to the discussion about the work.</li>
+<li><b>Test matrices.</b> Put test cases in rows and environments in columns, and record results with checkboxes. A formula gives the pass rate of each row, and a color scale shows where cases fail.</li>
+<li><b>Release checklists.</b> Track tasks with an owner, a due date and a status. A dropdown list keeps status values consistent, a conditional formatting rule highlights overdue dates, and a filter shows what is still open.</li>
+<li><b>Data from customers or other systems.</b> Import an .xlsx or .csv file into the issue that tracks the request. Sort and filter it, remove duplicates, split text to columns and download the result.</li>
+<li><b>Plans and what-if questions.</b> Find the cheapest set of build agents for the capacity a release needs, the staffing that covers a plan, or the price that reaches a target margin. Solver, Goal Seek and scenarios work on the data in the issue, and their results are saved like any other change.</li>
+<li><b>Other tables for one issue.</b> Keep capacity plans, option comparisons, measurement results and field mappings in the issue instead of in attachments that go out of date.</li>
+</ul>
+
+<h2>What you can do</h2>
+<ul>
+<li><b>Edit together.</b> A cell is saved when you finish editing it (Enter, Tab or a click elsewhere), and other people see the change within a few seconds. Other people's selected cells are outlined in their color. Click an avatar in the bar to go to that person's cell. Rows and columns have stable IDs, so an edit lands on the right cell even when someone inserts or deletes rows at the same time.</li>
+<li><b>Write formulas.</b> Use 314 functions, 22 of which are alternative names for another function, such as STDEV for STDEV.S. They include XLOOKUP, INDEX and MATCH, SUMIFS, FILTER, SORT, UNIQUE, TEXTSPLIT, LET, NETWORKDAYS, PMT, NPV, XIRR and regular expression functions. Dynamic arrays spill into neighboring cells. Use absolute and mixed references, references to other sheets, named ranges and table references such as Budget[Total]. Autocomplete, argument hints for 90 common functions and colored cell references help while you type. In the Insert function dialog, you can search all 314 functions or browse common ones in 9 categories.</li>
+<li><b>Organize data in tables.</b> Format a range as a table with a header row, a total row, banded rows, filter buttons and one of 7 color styles. Filter a column by a searchable list of values or by one of 12 conditions. The total row leaves out rows hidden by a filter. Sort by several levels, remove duplicates and split text to columns.</li>
+<li><b>Format and highlight.</b> Use number, currency, accounting, percent, scientific, date, time, duration and custom formats. Set fonts, colors, borders, alignment and wrapping, merge cells and use a format painter. Conditional formatting has 30 rule types, including date rules, custom formulas, 2- and 3-color scales, data bars and an arrow icon set.</li>
+<li><b>Check typed input.</b> Data validation offers dropdown lists (from items, a range or a named range), checkboxes, number, whole-number, date and text-length rules, and custom formulas. A rule can reject a value or only warn, and can show your own message.</li>
+<li><b>Add charts.</b> Create column, stacked column, bar, line, area, pie, doughnut and scatter charts from a range. Charts redraw when the data changes and can be moved and resized on the sheet.</li>
+<li><b>Run what-if analysis.</b> <b>Data &gt; Solver…</b> finds the values of variable cells that maximize or minimize an objective cell, or make it reach a value, subject to constraints (≤, =, ≥, integer, binary and AllDifferent). Choose the Simplex LP method for linear models, GRG Nonlinear (with Multistart) for smooth nonlinear models or Evolutionary for non-smooth models, and set their options. Solver can pause at each iteration and asks before it goes past a time or iteration limit. Keep the solution or restore the original values, save it as a scenario, and add Answer, Sensitivity, Limits, Population, Feasibility, Feasibility-Bounds or Linearity reports as new sheets. Each sheet keeps its Solver model, so everyone on the issue can solve it again, and models can be saved to cells and loaded from them. <b>Data &gt; What-if analysis</b> has Goal Seek and the Scenario Manager, with scenario summaries and merging scenarios from other sheets.</li>
+<li><b>Work with sheets, rows and columns.</b> Add up to 50 sheets and give them tab colors. A sheet starts with 100 rows and 26 columns (A to Z) and grows as you move or scroll past them, up to 20,000 rows and 200 columns. Insert and delete rows and columns, and formulas adjust to match. Hide, resize and autofit rows and columns. Freeze rows and columns, zoom from 75% to 150%, and see the Sum, Average, Min, Max and Count of a selection.</li>
+<li><b>Fill series and add notes and links.</b> The fill handle continues numbers, dates, month and weekday names, Q1 to Q4 and items such as "Item 1". Add cell notes and links. Ctrl+click opens a link in a new tab. Only http, https and mailto links open.</li>
+<li><b>Review changes.</b> The change history shows who changed which cells and when, with old and new values. For entries that changed cells, editors can put the old values back as a new change. This is not offered for entries that changed more than 60 cells, and values longer than 2,000 characters are skipped. Undo and redo cover your own changes since you opened the page, up to 200 steps. Reloading the page clears them.</li>
+<li><b>Use the keyboard.</b> Double-click a cell or press F2 to edit it, Ctrl+arrow to jump to the edge of the data, Ctrl+D to fill down, Alt+= for AutoSum and F4 for absolute references. The Getting Started section lists the main shortcuts.</li>
+</ul>
+
+<h2>Files and clipboard</h2>
+<ul>
+<li><b>Import .xlsx and .csv files.</b> Use the menu, or drop a file on the bar or the grid. On an issue without a spreadsheet, the file becomes the spreadsheet. On an issue that already has a spreadsheet, you choose whether to add the file's sheets or to replace all sheets. Replacing can be undone. An .xlsx import keeps values, formulas, number formats, styles, column widths, row heights, hidden rows and columns, merged cells, frozen panes, tables, workbook-level names, Solver models, scenarios, and list, number, date and text-length validation. It does not bring over charts, conditional formatting, notes, images or tab colors.</li>
+<li><b>Formulas in your language's style.</b> Where decimals are written with a comma, formulas use ; between arguments and , in numbers (=ROUND(1,5; 0)), as other spreadsheet apps do in that language. <b>View &gt; Formula separators</b> switches between comma and semicolon for you. Formulas are stored in one form, so colleagues with other settings see them in their own style.</li>
+<li><b>Download .xlsx and .csv files.</b> Download the whole spreadsheet as an .xlsx file with values, formulas, styles, number formats, sizes, merged cells, frozen panes, dropdown lists, named ranges, Solver models and scenarios, or the current sheet as a .csv file with comma, semicolon or tab separators and a point or comma as the decimal separator. Table references are written as cell ranges, and newer functions are written the way other spreadsheet apps expect them. Tables, charts, conditional formatting, notes, tab colors and validation rules other than dropdown lists are not written to the .xlsx file. Files are built in the browser and named after the issue ID.</li>
+<li><b>Copy and paste.</b> Paste ranges copied from other spreadsheet apps with their values, basic formatting and merged cells. When you copy cells into another app, it receives the values and basic formatting. Formulas are kept only when you copy and paste within the same page. Between the spreadsheet in the issue and the large window, between two issues or between browser tabs, only values and basic formatting are pasted. <b>Paste special</b> offers <b>Values only</b>, <b>Formulas only</b>, <b>Formatting only</b> and <b>Transposed</b>.</li>
+</ul>
+
+<h2>For administrators</h2>
+<ul>
+<li><b>Permissions.</b> Both widgets declare only the Read Issue (READ_ISSUE) permission, so YouTrack shows them to people who can read the issue. The app's backend checks every change separately. A change needs the Update Issue permission in the project, membership in one of the project's <b>Groups that can edit spreadsheets</b>, or the project setting <b>Everyone who can see the issue can edit</b>. Members of <b>Groups that can only view spreadsheets</b> never edit. Users with view-only access can still search, copy, open the change history, download the spreadsheet as an .xlsx file and download the current sheet as a .csv file.</li>
+<li><b>Storage.</b> Each spreadsheet is stored on its issue in three extension properties: the spreadsheet content, a log of recent changes and the change history. Presence (which cells a user has selected) is stored on the user. Layout preferences (height and zoom) are kept in each user's browser, in the app storage that YouTrack provides to the widget, if it is available.</li>
+<li><b>Updates and calculation.</b> Updates arrive by polling, not push. An open spreadsheet or the large window checks for changes every 1.5 to 2.5 seconds and a background browser tab every 30 seconds. A collapsed section loads nothing. Formulas are calculated in each viewer's browser. The server only stores what users enter.</li>
+<li><b>Limits.</b> 50 sheets per spreadsheet; 20,000 rows and 200 columns per sheet; 32,767 characters per cell; 4,000,000 characters per issue for the stored spreadsheet data (cell contents and formatting, row and column IDs, tables, rules and charts), with the change log and history stored separately; 500 change history entries.</li>
+<li><b>Removing the app.</b> Spreadsheets are stored in the app's extension properties. Download the ones you want to keep before you remove the app.</li>
+</ul>
+
+<h2>Known limits</h2>
+<ul>
+<li>When two people change the same cell, the later change is kept. If you insert or delete rows or columns while someone else changes the spreadsheet, the app rebuilds your change on the newer data and sends it again, up to 5 more times. If it still cannot be applied, you see a message and can try again. Undoing an insert or delete is not retried.</li>
+<li>Filters and sorting change the shared spreadsheet for everyone and need edit rights.</li>
+<li>Solver, Goal Seek and scenario summaries calculate in the browser of the person who runs them. Solver handles up to 500 variable cells and 2,000 constraint cells; the objective, the variable cells and the cells on the left side of constraints must be on the model's sheet. The Simplex LP method uses a dense tableau, so large linear models take longer. Keeping a solution writes the variable cells, and any reports, as one change that everyone sees.</li>
+<li>Data validation is checked only when a value is typed into a cell or picked from its list. Values that are pasted, filled, imported, replaced with Find and replace, split into columns or restored from the change history are not checked.</li>
+<li>The change history is not an audit log. Editors can delete entries. A user's consecutive cell edits are merged into one entry as long as each follows the previous one within 90 seconds and no entry from another person comes in between. Changes to sizes, hidden rows and columns, frozen panes, merged cells, tab colors and gridlines are not recorded. A note change is listed as "format changed" for its cell, without the note text.</li>
+<li>In an .xlsx download, formulas that return several values, such as FILTER or SORT, are written as single-cell formulas. Check these formulas after you open the file in another app.</li>
+<li>The interface and function names are in English. Numbers and dates follow the YouTrack locale, or the browser language if YouTrack does not provide one. The grid is built for mouse and keyboard, not touch.</li>
+</ul>
+
+<h2>Not included</h2>
+<ul>
+<li>Macros, pivot tables, LAMBDA and its helper functions, external data connections, images and shapes, threaded comments, sheet protection, printing and offline editing.</li>
+<li>Data tables (one- and two-variable what-if tables), forecast sheets, scenario PivotTable reports and outlined Solver reports.</li>
+<li>Formulas that read YouTrack issue fields or data from other issues.</li>
+</ul>
+
+<h2>Requirements</h2>
+<p>YouTrack 2026.2 or later. The app must be attached to a project before the issues of that project show the Spreadsheet section.</p>
+
+<p>For questions and bug reports, write to the vendor email address shown on this page.</p>
+
+<p>Developed by Oğuzhan Cengiz.</p>
+<p>YouTrack is a trademark of JetBrains s.r.o. Spreadsheets for YouTrack is not affiliated with or endorsed by JetBrains.</p>

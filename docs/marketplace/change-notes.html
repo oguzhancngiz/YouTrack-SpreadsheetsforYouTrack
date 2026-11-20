@@ -1,0 +1,75 @@
+<p>1.2.5: New logo.</p>
+<p>1.2.4: Small improvements.</p>
+<ul>
+<li><b>Formula separators</b> moved from the bar's <b>⋯</b> menu to <b>More tools</b> (the <b>⋯</b> at the end of the toolbar), which is now always shown. They are still in the <b>View</b> menu.</li>
+<li>The language that YouTrack reports is recognized also when it is written like tr_TR, so <b>Automatic</b> picks the right formula separators and number formats.</li>
+</ul>
+<p>1.2.3: A new name, formula separators and CSV options.</p>
+<ul>
+<li>The app is now called <b>Spreadsheets for YouTrack</b> and has an updated logo.</li>
+<li>Formulas follow your language: where decimals are written with a comma (1,5), formulas use ; between arguments and , in numbers, for example =ROUND(1,5; 0). Other languages keep , and . (=ROUND(1.5, 0)).</li>
+<li><b>View &gt; Formula separators</b>: Automatic, Comma or Semicolon, for you in this browser. Formulas are stored in one form, so people with different settings share them.</li>
+<li><b>Download sheet as CSV</b> asks for the separator between values (comma, semicolon or tab) and the decimal separator of numbers, and remembers your choice.</li>
+<li><b>Formula separators</b> are also in the bar's <b>⋯</b> menu.</li>
+<li>Buttons that open a menu or a color picker (the bar's <b>⋯</b>, <b>More tools</b>, number format, borders, merge, alignment, AutoSum, text and fill color, all sheets) close it on a second click.</li>
+<li>Fixed: formulas typed with semicolons were written to .xlsx files with semicolons, which other spreadsheet apps cannot read.</li>
+</ul>
+<p>1.2.2: Fixes.</p>
+<ul>
+<li>Fixed: with several cells selected, the status bar showed an error, and a change made to the selection (such as bold or delete) was not saved until the next edit. This came with 1.2.1.</li>
+<li>A spreadsheet that cannot be loaded shows the error with a <b>Try again</b> button.</li>
+<li>Moving through the Solver Parameters dialog with Tab no longer switches the objective to <b>Value of</b>.</li>
+<li>After you add a sheet, the focus is in the grid, so typing does not add more sheets.</li>
+</ul>
+<p>1.2.1: Fixes from testing on YouTrack Cloud.</p>
+<ul>
+<li>Whole numbers with up to 11 digits are shown exactly in the General format (12345678901 was shown as 12345678900).</li>
+<li>Dialogs keep the keyboard focus: Tab and Shift+Tab move between the dialog's controls and no longer reach the sheet or the page behind it.</li>
+<li>The large window (<b>Open spreadsheet</b>) fits laptop screens without scrolling the YouTrack dialog.</li>
+<li><b>Cut</b>, <b>Copy</b> and <b>Paste</b> in the Edit menu work within the spreadsheet when the browser blocks the system clipboard.</li>
+<li>With a menu open, one click on another menu opens it.</li>
+<li>Dropdown lists that do not fit scroll instead of covering their button.</li>
+<li>The status bar shows whole numbers exactly and other numbers with up to 10 significant digits.</li>
+<li>The change history shows a loader while it loads, closes with Esc, and shows <b>Clear history</b> only to users who can edit.</li>
+<li>Scenario Manager selects a scenario you add, and closes after <b>Summary</b> creates the summary sheet.</li>
+<li>The formula bar stays one line until you type in it, so the grid no longer moves when you select a cell with long text.</li>
+</ul>
+<p>1.2.0: A native YouTrack look and a permission fix.</p>
+<ul>
+<li>Fixed: users who could only read an issue could create and edit its spreadsheet. Creating and editing now needs YouTrack's Update Issue permission in the project, whichever role grants it (global, project or custom roles).</li>
+<li>New project settings: groups that can edit spreadsheets even without Update Issue, and groups that can only view them.</li>
+<li>The spreadsheet lives in YouTrack's own <b>Spreadsheet</b> section: collapse and expand it with the section header. The app's duplicate titles (in the issue and in the large window) and its own collapse button are gone, and an issue without a spreadsheet shows one short line.</li>
+<li>Ring UI look: dropdowns instead of browser selects, dialogs with the primary button first, a single-row toolbar with a <b>More tools</b> menu, underlined sheet tabs, alert-style notifications and loaders.</li>
+<li>Dark theme: user-picked cell and table colors are shown with readable dark equivalents; color scales keep their order.</li>
+<li>View-only users see no editing controls.</li>
+</ul>
+<p>1.1.1: Fixed: users with only the Read Issue permission could edit spreadsheets.</p>
+<p>1.1.0: What-if analysis.</p>
+<ul>
+<li><b>Data &gt; Solver…</b>: maximize, minimize or reach a value of an objective cell by changing variable cells, subject to ≤, =, ≥, integer, binary and AllDifferent constraints.</li>
+<li>Three solving methods with their options: Simplex LP (with branch and bound for integer constraints), GRG Nonlinear (forward or central derivatives, Multistart) and Evolutionary (population size, mutation rate, random seed, time without improvement).</li>
+<li>Show Iteration Results, Stop, and a prompt to continue when the time or iteration limit is reached.</li>
+<li>Solver Results: keep the solution or restore the original values, save it as a scenario, and return to the Solver Parameters dialog.</li>
+<li>Answer, Sensitivity (shadow prices, reduced costs and allowable ranges, or Lagrange multipliers and reduced gradients), Limits, Population, Feasibility, Feasibility-Bounds and Linearity reports, added as new sheets.</li>
+<li>Solver models are saved with each sheet and follow inserted and deleted rows and columns; Load/Save stores a model in cells.</li>
+<li><b>Data &gt; What-if analysis</b>: Goal Seek, and the Scenario Manager with Add, Edit, Delete, Show, Merge and Summary.</li>
+<li>Solver models and scenarios are written to .xlsx downloads and read from .xlsx imports.</li>
+</ul>
+<p>Also in 1.1.0:</p>
+<ul>
+<li>Sheets grow past their first 100 rows and 26 columns when you move or scroll past the last row or column, or go to a cell beyond them in the name box, up to 20,000 rows and 200 columns. The added rows and columns are not an undo step and do not appear in the change history.</li>
+<li>Double-click a cell to edit it.</li>
+</ul>
+<p>1.0.1: Fixed: users who can update the issue could not create or edit the spreadsheet. Edit rights now follow YouTrack's permissions on each issue (global and project roles, custom roles, the issue's access settings) and change without reloading.</p>
+<p>1.0.0: First release.</p>
+<ul>
+<li>Spreadsheet bar above the issue's activity stream that expands into the spreadsheet and collapses to one line.</li>
+<li>The <b>Open spreadsheet</b> item in the issue's options menu, which shows the same spreadsheet in a large window.</li>
+<li>Shared editing: changes appear for others within a few seconds, and other people's selected cells are shown in their color.</li>
+<li>314 functions, dynamic arrays, named ranges and table references.</li>
+<li>Tables with filters and total rows, multi-level sorting, number formats, conditional formatting with 30 rule types, data validation and 8 chart types.</li>
+<li>Import from .xlsx and .csv files, download as .xlsx or .csv, and copy and paste with other spreadsheet apps.</li>
+<li>Change history with restore, and undo and redo for your own changes.</li>
+<li>Project setting "Everyone who can see the issue can edit", off by default.</li>
+<li>Follows the YouTrack light and dark themes.</li>
+</ul>

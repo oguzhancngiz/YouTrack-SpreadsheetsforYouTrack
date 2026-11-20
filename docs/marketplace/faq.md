@@ -1,0 +1,88 @@
+# Spreadsheets for YouTrack FAQ
+
+**Does Spreadsheets for YouTrack send data outside our YouTrack?**
+No. The widget calls only the app's own endpoints, which run inside YouTrack. The app makes no requests to external servers, loads no scripts or fonts from the internet, and has no telemetry, analytics or license check. Downloaded files (.xlsx and .csv) are created in the browser when a user chooses a Download item, and are saved only on that user's device.
+
+**Where are the spreadsheets stored?**
+On the issue, in three extension properties that the app adds: `sheetDoc` (the spreadsheet content), `sheetLog` (recent changes, used by open browsers to catch up) and `sheetHistory` (the change history). Presence (which issue and cells a user has selected) is stored on the user in `sheetPresence` and `sheetPresenceIssue`. Personal preferences (panel height, zoom, formula separators and CSV download options) are kept in each user's browser, in the app storage that YouTrack provides to the widget, if it is available.
+
+**Who can see and edit a spreadsheet?**
+Everyone who can see the issue can view its spreadsheet, search it, copy from it, open the change history and download it as .xlsx (all sheets) or the current sheet as .csv. Creating and editing a spreadsheet needs YouTrack's **Update Issue** permission in the project, whichever role grants it (global, project or custom roles); the app never looks at role names, so a role with only **Read Issue** gets a view-only spreadsheet. Three project settings change this: **Groups that can edit spreadsheets** (members edit even without Update Issue), **Groups that can only view spreadsheets** (members never edit, even with Update Issue) and **Everyone who can see the issue can edit** (off by default). When permissions or these settings change, an open spreadsheet follows within seconds, without reloading the page.
+
+**Can the app add its own permissions, such as "Spreadsheet Reader", to YouTrack roles?**
+No. YouTrack apps cannot add permissions to the role editor; they can only use YouTrack's own permissions. That is why editing follows Update Issue, and the project settings above give you per-group control. If users with view-only access should not take copies of the data, keep this in mind before you attach the app to a project.
+
+**How quickly do other people see my changes?**
+A cell is sent when you finish editing it (Enter, Tab or a click elsewhere), not while you type. A spreadsheet that is open in an issue or in the large window checks for changes every 1.5 seconds when other people are viewing the same spreadsheet and every 2.5 seconds otherwise, so others usually see a change within a few seconds. A background browser tab checks every 30 seconds, and a collapsed Spreadsheet section loads nothing. While someone edits a cell, the tooltip of their avatar shows "(typing)".
+
+**What happens when two people edit at the same time?**
+Edits to different cells do not interfere. Rows and columns have stable IDs, so an edit lands on the right cell even if someone inserts or deletes rows at the same moment. When two people change the same cell, the later change is kept. A cell's value, format and note are kept apart, so if one person changes the value and another the format, both changes stay. Inserting or deleting rows and columns is checked against the latest version. If someone else changed the sheet in the meantime, the app rebuilds your change on the new version and tries again, up to 5 times. An undo or redo of a row or column change is not retried. If the app still cannot apply a change, you see a message and can repeat the change.
+
+**What if the connection drops?**
+The bar shows "Offline – retrying". Unsent changes are retried with growing delays of up to 30 seconds. They are kept in the browser's memory only, so they are lost if you close the page while offline.
+
+**Can we import our existing spreadsheets?**
+Yes, .xlsx and .csv files (.tsv and .txt work too). An .xlsx import keeps values, formulas, number formats, fonts, fills, borders, alignment, column widths, row heights, hidden rows and columns, merged cells, frozen panes, tables, workbook-level names, and list, number, date and text-length validation. Solver models and scenarios are imported too. Charts, conditional formatting, notes, images, other sheet-level names and tab colors are not imported. Theme colors are approximated, rich text in a cell becomes plain text, and data beyond 20,000 rows or 200 columns is left out. Cells with formulas that use a function the app does not have show the #NAME? error. A .csv import detects tab, semicolon or comma separators and reads numbers and dates in your locale.
+
+**Will a downloaded .xlsx file work in other spreadsheet apps?**
+The download is an .xlsx file with values, formulas (with their last calculated values), styles, number formats, sizes, merged cells, frozen panes, dropdown lists, names, Solver models and scenarios. Table references such as Budget[Total] are written as cell ranges, and newer functions such as XLOOKUP, FILTER or LET are written with the names other spreadsheet apps expect. Tables, charts, conditional formatting, notes, validation rules other than dropdown lists, and tab colors are not written. Formulas that return several values, such as FILTER or SORT, are written as single-cell formulas. Check these formulas after you open the file.
+
+**Can I copy and paste between Spreadsheets for YouTrack and other spreadsheet apps?**
+Yes, for values and basic formatting (bold, italic, underline, colors and alignment). Pasting in also keeps merged cells. Formulas are kept only when you copy and paste within the same page. Between the spreadsheet in the issue and the large window, between two issues or between browser tabs, only values and basic formatting are pasted.
+
+**Which functions are included, and which are missing?**
+There are 314 function names. Of these, 292 are separate implementations and 22 are alternative names for another function, for example STDEV for STDEV.S. They cover math, statistics, logic, text, date and time, lookup (XLOOKUP, INDEX and MATCH, VLOOKUP), dynamic arrays (FILTER, SORT, UNIQUE, SEQUENCE, VSTACK), LET, regular expressions and financial functions (PMT, NPV, XNPV, IRR, XIRR). Not included: LAMBDA and its helpers (MAP, BYROW, BYCOL, REDUCE, SCAN, MAKEARRAY), database, cube and web functions, and most engineering functions. The base conversion functions BIN2DEC, DEC2BIN, DEC2HEX, DEC2OCT, HEX2DEC and OCT2DEC are included. Regular expressions use JavaScript syntax. Circular references show #CIRC! and are not calculated iteratively.
+
+**Does it have Solver, Goal Seek and scenarios?**
+Yes. **Data > Solver…** changes variable cells to maximize or minimize an objective cell, or to make it reach a value, subject to constraints with ≤, =, ≥, integer, binary and AllDifferent. It has three methods: Simplex LP for linear models, with a sensitivity report of shadow prices, reduced costs and allowable ranges; GRG Nonlinear for smooth nonlinear models, with optional Multistart to look for the global optimum; and Evolutionary for models with IF, ABS, lookups and other non-smooth formulas. Integer constraints are solved by branch and bound within the Integer Optimality tolerance (1% by default; set it to 0 for the best integer solution). Reports (Answer, Sensitivity, Limits, Population, Feasibility, Feasibility-Bounds, Linearity) are added as new sheets. Each sheet keeps its model, and .xlsx files keep models and scenarios in the format other spreadsheet apps use, so a model made elsewhere opens with its settings. **Data > What-if analysis** has Goal Seek and the Scenario Manager. All calculation runs in the browser of the person who solves; nothing is sent to other servers.
+
+**Can formulas use issue fields such as the assignee or an estimate?**
+No. Formulas work only with the cells of the spreadsheet. They cannot read issue fields or other issues.
+
+**Is the change history an audit log?**
+No. It shows who changed which cells and when, with old and new values, but editors can delete entries or clear it. It keeps the last 500 entries. Consecutive cell edits by the same person are merged into one entry as long as each comes within 90 seconds of the previous one and no entry from another person comes in between. An entry records up to 60 cells, and the panel shows the first 12. Inserting or deleting rows, columns and sheets is listed as an event without the cell values. Changes to column widths, row heights, hidden rows and columns, frozen panes, merged cells, gridlines and tab colors, and the text of notes, are not recorded.
+
+**Can I restore the whole spreadsheet to an earlier state?**
+No. You can restore the old values and formats of the cells listed in one history entry. This is not offered for changes that covered more than 60 cells, values longer than 2,000 characters cannot be restored, and deleted rows and sheets cannot be brought back from the history.
+
+**How does undo work?**
+Undo and redo cover your own changes since you opened the page, up to 200 steps. Reloading the page clears them. Undoing your change can overwrite a later change by someone else to the same cell.
+
+**Do filters and sorting affect other users?**
+Yes. Filters and sort order are part of the shared spreadsheet, so everyone sees them, and setting them needs edit rights.
+
+**Does a table's total row follow the filter?**
+Yes. The total row uses SUBTOTAL(109, …), which leaves out rows hidden by a filter and rows hidden by hand. SUBTOTAL with 1 to 11 leaves out filtered rows only, and AGGREGATE follows its options, as in other spreadsheet apps.
+
+**Is data validation checked for every value?**
+No. Rules are checked in the browser when a value is typed into a cell or the formula bar, and a dropdown list offers only the items of its list. Values that are pasted, filled, imported, replaced with Find and replace, split into columns or restored from the change history are not checked. A rule of the **Custom formula** type is checked with the new value in place: write its formula for the top-left cell of the rule's range, and the app adjusts it for the other cells. The value is accepted when the formula returns TRUE or a number other than 0.
+
+**Why do TODAY() and NOW() show different values for different people?**
+Formulas are calculated in each viewer's browser, so TODAY and NOW use that viewer's clock and time zone, and RAND gives each viewer different numbers.
+
+**Which languages and currencies are supported?**
+The interface and function names are in English. Numbers and dates are entered and shown in your locale (the YouTrack locale, or your browser language if YouTrack does not provide one), with its decimal separator and date order, and stored in one format, so everyone sees the same value. Format > Number > Currency offers the currency of your locale and $, €, £, ₺ and ¥, and custom formats can show other symbols. The currency button on the toolbar and Ctrl+Shift+4 apply the currency of your locale when the app knows it, and $ otherwise. In formulas, languages that write 1,5 use ; between arguments and , in numbers (=ROUND(1,5; 0)), and other languages use , and . (=ROUND(1.5, 0)); View > Formula separators changes this for you. Formulas are stored in one form, so people with different settings share them.
+
+**Does it follow the dark theme?**
+It follows the YouTrack light or dark theme, not the operating system setting, and uses the Ring UI color variables. Chart text and grid lines follow the theme too.
+
+**Why does a keyboard shortcut not work?**
+The browser keeps some shortcuts for itself, for example Ctrl+T, Ctrl+N and Ctrl+W, so they do not reach the spreadsheet. If a shortcut does not work, use the menu item instead, for example Insert > Table.
+
+**Why can't I paste from other apps with the menu?**
+The browser may block clipboard access from the menu inside YouTrack. Cut, Copy and Paste in the menu still work within the spreadsheet. To copy into or paste from other apps, use Ctrl+X, Ctrl+C and Ctrl+V in the grid.
+
+**What are the limits?**
+50 sheets per spreadsheet; 20,000 rows and 200 columns per sheet (a new sheet starts with 100 rows and 26 columns and grows when you paste or fill); 32,767 characters per cell; 4,000 characters per note; 500 named ranges; 200 tables, 200 conditional formatting rules, 200 validation rules and 200 charts per sheet; 4,000,000 characters of spreadsheet content per issue, with the change log and history stored separately; 500 change history entries.
+
+**Does it work on tablets and phones?**
+The grid is built for mouse and keyboard. Touch interaction is not optimized.
+
+**Do spreadsheet edits create notifications?**
+The app does not add comments or send notifications for spreadsheet edits. Edits are recorded in the app's own change history.
+
+**What happens to the spreadsheets if we remove the app?**
+The spreadsheets are stored in extension properties that belong to the app. Download any spreadsheets you want to keep before you remove it.
+
+**Which YouTrack versions are supported?**
+The app requires YouTrack 2026.2 or later.

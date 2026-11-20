@@ -1,0 +1,1 @@
+A shared spreadsheet in YouTrack issues for estimates, budgets, test matrices and checklists, with formulas, tables, charts and change history, and import and export of .xlsx and .csv files.
