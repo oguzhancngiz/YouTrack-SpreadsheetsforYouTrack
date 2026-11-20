@@ -13,7 +13,7 @@ labels match.
 | Description | [description.html](description.html) | Paste into the description editor and set the description source to the Marketplace version so later uploads don't replace it. The first 40 characters, "A shared spreadsheet in YouTrack issues.", become the preview card. |
 | Description in the ZIP | `manifest.json` `description` | Plain text, same first sentence. Shown in YouTrack under Administration > Apps. |
 | Change notes | [change-notes.html](change-notes.html) | `manifest.json` `changeNotes` is a shorter plain-text version of the same release notes. |
-| Tags | [tags.txt](tags.txt) | Productivity, Reporting, Project Management (chosen from the YouTrack app tag list in the upload form) |
+| Tags | [tags.txt](tags.txt) | Issue View, Productivity, Data Visualization, Project Management. Not Reporting (that means reports on YouTrack data) or Diagrams, Dashboard, Testing. |
 | Getting Started | [getting-started.html](getting-started.html) | HTML for the Getting Started field. [getting-started.md](getting-started.md) is the same text in Markdown. |
 | Custom page "FAQ" | [faq.md](faq.md) | Custom pages take Markdown. |
 | Custom page "Privacy" + Privacy Policy URL | [privacy.md](privacy.md) | Publish as a Custom page (or on the Codeo website) and put its URL in the Privacy Policy field. |

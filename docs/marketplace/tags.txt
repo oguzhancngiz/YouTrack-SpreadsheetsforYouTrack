@@ -1,3 +1,4 @@
+Issue View
 Productivity
-Reporting
+Data Visualization
 Project Management
