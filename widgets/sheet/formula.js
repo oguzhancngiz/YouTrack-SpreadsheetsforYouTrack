@@ -33,6 +33,74 @@ const ERR = {};
   .forEach((c) => { ERR[c] = new FormulaError(c); });
 export const ERRORS = ERR;
 export const isErr = (v) => v instanceof FormulaError;
+/* #CALC! of a formula that the work budget stopped (not an empty result): a separate value with the same code, so the
+ * widget can tell the two apart and say why. */
+const SLOW = new FormulaError('#CALC!');
+SLOW.slow = true;
+export const isSlowCalc = (v) => v === SLOW;
+
+/* Work budget. One burst of evaluation (a render, a recalculation) may take this many steps; after that formulas
+ * give #CALC! instead of freezing the page. The budget refills when the burst is over and when values are cleared. */
+const BUDGET = 3e7, BUDGET_MS = 1500;
+// byClock: the budget of this burst ran out because the clock did (not the steps); burstNo counts the bursts that are over
+let budget = BUDGET, burst = false, clock = 0, calls = 0, deadline = 0, byClock = false, burstNo = 0;
+function refill() { budget = BUDGET; deadline = 0; byClock = false; }
+function tick(n) {
+  if (!burst) { burst = true; Promise.resolve().then(() => { burst = false; burstNo++; refill(); }); }
+  budget -= n;
+  if (budget < 0) throw SLOW;
+  // steps are not equally slow (one array function can work on a million values), so the clock is checked now and
+  // then too: after many steps, and after every few calls (each formula part that is evaluated makes one)
+  if ((clock += n) >= 50000 || ++calls >= 16) {
+    clock = 0; calls = 0;
+    const now = Date.now();
+    if (!deadline) deadline = now + BUDGET_MS;
+    else if (now > deadline) { budget = -1; byClock = true; throw SLOW; }
+  }
+}
+const spent = () => budget < 0;
+/** True while the current burst has used up the work budget: values read now may be #CALC! only for lack of time, so
+ * results built from them must not be kept (the widget draws again to compute the rest). */
+export const budgetSpent = spent;
+/** Counts n steps of work done outside formulas (statistics of conditional formatting rules) against the budget:
+ * throws the budget's #CALC! (isSlowCalc) when it is used up. */
+export function charge(n) { tick(n); }
+/* Whether all of the burst's budget is left, but for a few steps (the formula that reads the one starting now): an
+ * evaluation that starts then and is still stopped cannot be finished in any burst. */
+const wholeBudget = () => budget >= BUDGET - 1e4 && (!deadline || deadline - Date.now() >= BUDGET_MS - 15);
+/* A page in the background runs slower (and may be throttled): there the clock does not prove a formula too heavy. */
+const pageHidden = () => typeof document !== 'undefined' && document.hidden === true;
+// kept results of formulas outside cells (conditional formatting, see evalAt): at most this many, in two generations
+// (the older one is dropped when the newer one is half of it), so that results drawn recently stay
+const KEEP_MAX = 300000;
+const clockNow = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+const fixedFormulas = new Map();
+/**
+ * Whether a formula gives the same wherever it is evaluated: no relative references (copying it elsewhere does not
+ * change it), nothing that reads the position (ROW(), COLUMN(), this-row table references, columns of the cell's own
+ * table, INDIRECT, OFFSET, CELL, ADDRESS), and only defined names (names: the workbook's) of which the same is true.
+ * Such a formula too heavy to compute in one cell is too heavy in all of them. Kept until Engine.invalidate.
+ */
+export function cellIndependent(text, names, depth = 0) {
+  const t = String(text ?? '');
+  let f = fixedFormulas.get(t);
+  if (f !== undefined) return f;
+  const withEq = t[0] === '=' ? t : '=' + t;
+  f = !/\b(ROW|COLUMN|INDIRECT|OFFSET|CELL|ADDRESS)\s*\(|\[\s*@|#this\s+row/i.test(t) && translateFormula(withEq, 1, 1) === withEq;
+  if (f) {
+    let toks = [];
+    try { toks = tokenize(withEq.slice(1)); } catch (e) { f = false; }
+    for (const k of toks) {
+      if (k.t === 'sref' && !k.table) { f = false; break; }
+      if (k.t !== 'name' || !names) continue;
+      const def = names[k.v] ?? Object.entries(names).find(([n]) => n.toUpperCase() === k.v)?.[1];
+      if (def !== undefined && (depth >= 4 || !cellIndependent(def, names, depth + 1))) { f = false; break; }
+    }
+  }
+  if (fixedFormulas.size >= 2000) fixedFormulas.clear();
+  fixedFormulas.set(t, f);
+  return f;
+}
 
 /* ================================================================ addresses */
 
@@ -47,6 +115,15 @@ export function colIndex(name) {
   return n - 1;
 }
 const MAX_COL = 16383, MAX_ROW = 1048575;
+// text as long as Excel allows in a cell, arrays no bigger than a sheet (20000 rows x 200 columns)
+const MAX_TEXT = 32767, MAX_CELLS = 20000 * 200;
+const longText = (s) => typeof s === 'string' && s.length > MAX_TEXT;
+/** Throws #VALUE! when an array of rows x cols would be bigger than a sheet; returns the cell count. */
+function arraySize(rows, cols) {
+  if (!(rows >= 1 && cols >= 1 && rows * cols <= MAX_CELLS)) throw ERR['#VALUE!'];
+  tick(rows * cols);
+  return rows * cols;
+}
 
 /** "B3" → {r: 2, c: 1}; also accepts "$B$3". */
 export function parseAddr(text) {
@@ -181,7 +258,9 @@ export function tokenize(src) {
       else if (ch === ')') tok = { t: 'rp', text: ch };
       else if (ch === ',' || ch === ';') tok = { t: 'sep', text: ch };
       else if (ch === ':') tok = { t: 'op', text: ':' };
-      else tok = { t: 'bad', text: ch };
+      // a quote that does not start 'Sheet name'! makes the formula invalid: take the rest in one token, so that
+      // runs of quotes are not scanned again from every position
+      else tok = { t: 'bad', text: ch === "'" ? s : ch };
     }
     tok.s = i;
     tok.e = i + tok.text.length;
@@ -197,9 +276,23 @@ export function tokenize(src) {
 class ParseError extends Error {}
 const BIN_PREC = { '=': 1, '<>': 1, '<': 1, '>': 1, '<=': 1, '>=': 1, '&': 2, '+': 3, '-': 3, '*': 4, '/': 4, '^': 5 };
 
+/** Splits a row of an array constant at the commas outside "text" (with an even number of quotes after them). */
+function splitRow(row) {
+  const cuts = [];
+  let quotes = 0;
+  for (let i = row.length - 1; i >= 0; i--) {
+    if (row[i] === '"') quotes++;
+    else if (row[i] === ',' && quotes % 2 === 0) cuts.push(i);
+  }
+  const out = [];
+  let from = 0;
+  for (let k = cuts.length - 1; k >= 0; k--) { out.push(row.slice(from, cuts[k])); from = cuts[k] + 1; }
+  out.push(row.slice(from));
+  return out;
+}
 function parseArrayLiteral(text) {
   const inner = text.slice(1, -1);
-  return inner.split(';').map((row) => row.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map((cell) => {
+  return inner.split(';').map((row) => splitRow(row).map((cell) => {
     const t = cell.trim();
     if (/^".*"$/.test(t)) return t.slice(1, -1).replace(/""/g, '"');
     if (/^(TRUE|FALSE)$/i.test(t)) return t.toUpperCase() === 'TRUE';
@@ -434,7 +527,7 @@ export class Range {
 const isMatrix = (v) => Array.isArray(v);
 const isMulti = (v) => (v instanceof Range && (v.rows > 1 || v.cols > 1)) || (isMatrix(v) && (v.length > 1 || (v[0] && v[0].length > 1)));
 function toMatrix(v) {
-  if (v instanceof Range) return v.matrix();
+  if (v instanceof Range) return v.matrix(); // each cell read counts against the work budget
   if (isMatrix(v)) return v;
   return [[v]];
 }
@@ -448,6 +541,7 @@ function mapMatrix(m, fn) { return m.map((row) => row.map(fn)); }
 function broadcast(a, b, fn) {
   const A = toMatrix(a), B = toMatrix(b);
   const rows = Math.max(A.length, B.length), cols = Math.max(A[0].length, B[0].length);
+  arraySize(rows, cols);
   const pick = (M, i, j) => {
     const ii = M.length === 1 ? 0 : i, jj = M[0].length === 1 ? 0 : j;
     return ii < M.length && jj < M[0].length ? M[ii][jj] : ERR['#N/A'];
@@ -461,7 +555,7 @@ function broadcast(a, b, fn) {
 function textToNumber(s) {
   const t = String(s).trim();
   if (!t) return 0;
-  let m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(%?)$/i.exec(t);
+  let m = /^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(%?)$/i.exec(t);
   if (m) return parseFloat(m[1]) / (m[2] ? 100 : 1);
   m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(t);
   if (m) return dateToSerial(+m[1], +m[2], +m[3]);
@@ -505,7 +599,7 @@ export function numToText(n) {
 function* flat(args) {
   for (const a of args) {
     if (a instanceof Range) { for (const v of a.values()) yield { v, ref: true }; }
-    else if (isMatrix(a)) { for (const row of a) for (const v of row) yield { v, ref: true }; }
+    else if (isMatrix(a)) { for (const row of a) { tick(row.length); for (const v of row) yield { v, ref: true }; } }
     else yield { v: a, ref: false };
   }
 }
@@ -547,16 +641,59 @@ const finite = (x) => (typeof x === 'number' && !isFinite(x) ? ERR['#NUM!'] : x)
 
 /* ================================================================ criteria (COUNTIF, SUMIF, …) */
 
-function wildcardRe(pattern) {
-  let re = '';
+// Wildcards (* any text, ? one character, ~ escapes the next one) are matched without regular expressions, so that
+// a pattern such as *a*a*a*b costs at most text length x pattern length steps instead of backtracking.
+const W_STAR = 1, W_ANY = 2;
+/** A character in the case used to compare without case (as a regular expression with the i flag does). */
+function canon(ch) {
+  const u = ch.toUpperCase();
+  return u.length !== 1 || (ch.charCodeAt(0) >= 128 && u.charCodeAt(0) < 128) ? ch : u;
+}
+function wildcardTokens(pattern) {
+  const t = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
-    if (ch === '~' && i + 1 < pattern.length) { re += pattern[++i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); continue; }
-    if (ch === '*') re += '[\\s\\S]*';
-    else if (ch === '?') re += '[\\s\\S]';
-    else re += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (ch === '~' && i + 1 < pattern.length) t.push(canon(pattern[++i]));
+    else if (ch === '*') { if (t[t.length - 1] !== W_STAR) t.push(W_STAR); }
+    else t.push(ch === '?' ? W_ANY : canon(ch));
   }
-  return new RegExp('^' + re + '$', 'i');
+  return t;
+}
+/** Whether the whole text matches the wildcard tokens. */
+function wildcardMatch(tok, s) {
+  let i = 0, p = 0, star = -1, back = 0, steps = 0;
+  while (i < s.length) {
+    steps++;
+    const t = tok[p];
+    if (p < tok.length && t !== W_STAR && (t === W_ANY || t === canon(s[i]))) { i++; p++; }
+    else if (t === W_STAR) { star = p++; back = i; }
+    else if (star >= 0) { p = star + 1; i = ++back; }
+    else break;
+  }
+  tick(steps);
+  if (i < s.length) return false;
+  while (tok[p] === W_STAR) p++;
+  return p === tok.length;
+}
+/** Start of the first match of the wildcard tokens in the text at or after `from`, or -1 (for SEARCH). */
+function wildcardFind(tok, s, from) {
+  // the part before the first * starts the match; the parts after each * follow it in order
+  const parts = [[]];
+  for (const t of tok) { if (t === W_STAR) parts.push([]); else parts[parts.length - 1].push(t); }
+  const find = (part, q) => {
+    for (; q + part.length <= s.length; q++) {
+      tick(part.length + 1);
+      let k = 0;
+      while (k < part.length && (part[k] === W_ANY || part[k] === canon(s[q + k]))) k++;
+      if (k === part.length) return q;
+    }
+    return -1;
+  };
+  const start = find(parts[0], Math.max(0, from));
+  if (start < 0) return -1;
+  let q = start + parts[0].length;
+  for (let k = 1; k < parts.length; k++) { const f = find(parts[k], q); if (f < 0) return -1; q = f + parts[k].length; }
+  return start;
 }
 function makeCriteria(crit) {
   crit = scalar(crit);
@@ -585,13 +722,14 @@ function makeCriteria(crit) {
   }
   const up = s.toUpperCase();
   if (up === 'TRUE' || up === 'FALSE') { const b = up === 'TRUE'; return (v) => (op === '<>' ? v !== b : v === b); }
-  const re = /[*?~]/.test(s) ? wildcardRe(s) : null;
+  const tok = /[*?~]/.test(s) ? wildcardTokens(s) : null;
+  if (tok && s.length > 255) throw ERR['#VALUE!']; // Excel's limit for criteria
   const low = s.toLowerCase();
   return (v) => {
     if (isErr(v)) return false;
     const str = v === null ? '' : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : typeof v === 'number' ? numToText(v) : String(v);
     if (op === '=' || op === '<>') {
-      const eq = re ? re.test(str) : str.toLowerCase() === low;
+      const eq = tok ? wildcardMatch(tok, str) : str.toLowerCase() === low;
       return op === '=' ? eq : !eq;
     }
     if (typeof v !== 'string') return false;
@@ -638,6 +776,7 @@ export function compare(a, b) {
 
 export function formatWithPattern(value, pattern, locale) {
   if (typeof value !== 'number') return toStr(value);
+  if (String(pattern).length > 255) return numToText(value); // longer than Excel allows for a format
   const sections = String(pattern).split(';');
   let pat = sections[0];
   let v = value;
@@ -655,7 +794,7 @@ export function formatWithPattern(value, pattern, locale) {
   const num = pct ? v * 100 : v;
   const intPart = m && m[1] ? m[1].replace(/,/g, '') : '';
   const minInt = (intPart.match(/0/g) || []).length;
-  let txt = Math.abs(num).toFixed(maxDecimals);
+  let txt = Math.abs(num).toFixed(Math.min(maxDecimals, 100)); // toFixed allows 100 decimals; more are padded below
   let [ip, dp] = txt.split('.');
   if (dp) { dp = dp.replace(/0+$/, ''); if (dp.length < decimals) dp = dp.padEnd(decimals, '0'); }
   ip = ip.padStart(minInt, '0');
@@ -672,12 +811,15 @@ export function formatWithPattern(value, pattern, locale) {
 
 function formatDatePattern(serial, pat, locale) {
   const p = serialToParts(serial);
+  if (!Number.isFinite(p.y)) return '########'; // not a date (as Excel shows it)
   const ampm = /AM\/PM|A\/P/i.test(pat);
   let out = '';
   const re = /"[^"]*"|\\.|yyyy|yy|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|AM\/PM|A\/P|./gi;
   let lastWasHour = false;
   const loc = locale || 'en-US';
-  const fmt = (o) => new Intl.DateTimeFormat(loc, { ...o, timeZone: 'UTC' }).format(Date.UTC(p.y, p.m - 1, p.d));
+  const fmt = (o) => {
+    try { return new Intl.DateTimeFormat(loc, { ...o, timeZone: 'UTC' }).format(Date.UTC(p.y, p.m - 1, p.d)); } catch (e) { return '#'; }
+  };
   let m;
   while ((m = re.exec(pat))) {
     const tok = m[0];
@@ -834,7 +976,15 @@ const RAW = new Set(['ISBLANK', 'ISERROR', 'ISERR', 'ISNA', 'ISNUMBER', 'ISTEXT'
 /** Lifts a function over its first argument when that is an array or a multi-cell range. */
 function L(fn) {
   return (a, ...rest) => {
-    if (isMulti(a)) return mapMatrix(toMatrix(a), (x) => { try { return fn(x, ...rest); } catch (e) { if (isErr(e)) return e; throw e; } });
+    if (isMulti(a)) {
+      return mapMatrix(toMatrix(a), (x) => {
+        let v;
+        try { v = fn(x, ...rest); } catch (e) { if (isErr(e)) return e; throw e; }
+        // text made for every element counts against the work budget, and is not longer than a cell can hold
+        if (typeof v === 'string') { tick(v.length); if (v.length > MAX_TEXT) return ERR['#VALUE!']; }
+        return v;
+      });
+    }
     return fn(a, ...rest);
   };
 }
@@ -878,11 +1028,13 @@ F.RANDBETWEEN = (a, b) => { const lo = Math.ceil(numArg(a)), hi = Math.floor(num
 F.RANDARRAY = (rows, cols, min, max, whole) => {
   const r = numArg(rows, 1), c = numArg(cols, 1), lo = numArg(min, 0), hi = numArg(max, 1), int = boolArg(whole, false);
   if (r < 1 || c < 1 || hi < lo) return ERR['#VALUE!'];
+  arraySize(Math.floor(r), Math.floor(c));
   return Array.from({ length: r }, () => Array.from({ length: c }, () => (int ? lo + Math.floor(Math.random() * (hi - lo + 1)) : lo + Math.random() * (hi - lo))));
 };
 F.SEQUENCE = (rows, cols, start, step) => {
   const r = Math.floor(numArg(rows, 1)), c = Math.floor(numArg(cols, 1)), s = numArg(start, 1), st = numArg(step, 1);
   if (r < 1 || c < 1 || r * c > 1e6) return ERR['#VALUE!'];
+  tick(r * c);
   return Array.from({ length: r }, (_, i) => Array.from({ length: c }, (__, j) => s + (i * c + j) * st));
 };
 F.CEILING = (x, s) => { const v = numArg(x), sig = numArg(s, 1); return sig === 0 ? 0 : Math.ceil(v / sig - 1e-12) * sig; };
@@ -894,11 +1046,13 @@ F['FLOOR.PRECISE'] = F['FLOOR.MATH'];
 F.MROUND = (x, m) => { const v = numArg(x), mul = numArg(m); if (mul === 0) return 0; if (Math.sign(v) * Math.sign(mul) < 0) return ERR['#NUM!']; return roundTo(v / mul, 0, 'half') * mul; };
 F.EVEN = N1((x) => { const c = Math.ceil(Math.abs(x)); return Math.sign(x || 1) * (c % 2 ? c + 1 : c); });
 F.ODD = N1((x) => { const c = Math.ceil(Math.abs(x)); return Math.sign(x || 1) * (c % 2 ? c : c + 1); });
-F.FACT = N1((x) => { if (x < 0) return ERR['#NUM!']; let r = 1; for (let i = 2; i <= Math.floor(x); i++) r *= i; return r; });
-F.FACTDOUBLE = N1((x) => { if (x < -1) return ERR['#NUM!']; let r = 1; for (let i = Math.floor(x); i > 1; i -= 2) r *= i; return r; });
+// 170! and 300!! are the largest that fit in a number; larger arguments give #NUM! before looping (the whole part
+// counts, as in Excel: FACT(170.5) is 170!)
+F.FACT = N1((x) => { if (x < 0 || Math.floor(x) > 170) return ERR['#NUM!']; let r = 1; for (let i = 2; i <= Math.floor(x); i++) r *= i; return r; });
+F.FACTDOUBLE = N1((x) => { if (x < -1 || Math.floor(x) > 300) return ERR['#NUM!']; let r = 1; for (let i = Math.floor(x); i > 1; i -= 2) r *= i; return r; });
 F.COMBIN = (n, k) => { const a = Math.floor(numArg(n)), b = Math.floor(numArg(k)); return a < 0 || b < 0 || b > a ? ERR['#NUM!'] : combin(a, b); };
 F.COMBINA = (n, k) => { const a = Math.floor(numArg(n)), b = Math.floor(numArg(k)); return a < 0 || b < 0 ? ERR['#NUM!'] : combin(a + b - 1, b); };
-F.PERMUT = (n, k) => { const a = Math.floor(numArg(n)), b = Math.floor(numArg(k)); if (a < 0 || b < 0 || b > a) return ERR['#NUM!']; let r = 1; for (let i = 0; i < b; i++) r *= a - i; return r; };
+F.PERMUT = (n, k) => { const a = Math.floor(numArg(n)), b = Math.floor(numArg(k)); if (a < 0 || b < 0 || b > a) return ERR['#NUM!']; let r = 1; for (let i = 0; i < b && isFinite(r); i++) r *= a - i; return r; };
 F.GCD = (...a) => numbers(a).map(Math.floor).reduce((x, y) => { while (y) [x, y] = [y, x % y]; return x; }, 0);
 F.LCM = (...a) => numbers(a).map(Math.floor).reduce((x, y) => { if (!x || !y) return 0; let g = x, h = y; while (h) [g, h] = [h, g % h]; return (x * y) / g; }, 1);
 F.SIN = N1(Math.sin); F.COS = N1(Math.cos); F.TAN = N1(Math.tan);
@@ -926,11 +1080,14 @@ F.SUMXMY2 = (x, y) => pairs(x, y).reduce((s, [a, b]) => s + (a - b) ** 2, 0);
 F.MMULT = (a, b) => {
   const A = toMatrix(a), B = toMatrix(b);
   if (A[0].length !== B.length) return ERR['#VALUE!'];
+  arraySize(A.length, B[0].length);
+  tick(A.length * B.length * B[0].length / 4); // multiply-adds are cheaper than the steps the budget counts
   return A.map((row) => B[0].map((_, j) => row.reduce((s, x, k) => s + toNum(x) * toNum(B[k][j]), 0)));
 };
 F.MDETERM = (a) => {
   const M = toMatrix(a).map((r) => r.map((x) => toNum(x)));
   const n = M.length; if (n !== M[0].length) return ERR['#VALUE!'];
+  tick(n * n * n / 4);
   let det = 1;
   for (let i = 0; i < n; i++) {
     let p = i; for (let k = i + 1; k < n; k++) if (Math.abs(M[k][i]) > Math.abs(M[p][i])) p = k;
@@ -944,6 +1101,7 @@ F.MDETERM = (a) => {
 F.MINVERSE = (a) => {
   const M = toMatrix(a).map((r) => r.map((x) => toNum(x)));
   const n = M.length; if (n !== M[0].length) return ERR['#VALUE!'];
+  tick(n * n * n / 2);
   const I = M.map((r, i) => r.concat(Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))));
   for (let i = 0; i < n; i++) {
     let p = i; for (let k = i + 1; k < n; k++) if (Math.abs(I[k][i]) > Math.abs(I[p][i])) p = k;
@@ -954,8 +1112,12 @@ F.MINVERSE = (a) => {
   }
   return I.map((r) => r.slice(n));
 };
-F.MUNIT = (n) => { const k = Math.floor(numArg(n)); return Array.from({ length: k }, (_, i) => Array.from({ length: k }, (__, j) => (i === j ? 1 : 0))); };
-F.BASE = (n, radix, len) => { const v = Math.floor(numArg(n)), r = numArg(radix); if (v < 0 || r < 2 || r > 36) return ERR['#NUM!']; return v.toString(r).toUpperCase().padStart(numArg(len, 0), '0'); };
+F.MUNIT = (n) => { const k = Math.floor(numArg(n)); arraySize(k, k); return Array.from({ length: k }, (_, i) => Array.from({ length: k }, (__, j) => (i === j ? 1 : 0))); };
+F.BASE = (n, radix, len) => {
+  const v = Math.floor(numArg(n)), r = numArg(radix), k = numArg(len, 0);
+  if (v < 0 || r < 2 || r > 36 || !(k >= 0 && k <= 255)) return ERR['#NUM!']; // Excel allows at most 255 digits
+  return v.toString(r).toUpperCase().padStart(k, '0');
+};
 F.DECIMAL = (t, radix) => { const r = numArg(radix); const v = parseInt(strArg(t), r); return isNaN(v) ? ERR['#NUM!'] : v; };
 F.DEC2BIN = (n, p) => F.BASE(n, 2, p); F.DEC2OCT = (n, p) => F.BASE(n, 8, p); F.DEC2HEX = (n, p) => F.BASE(n, 16, p);
 F.BIN2DEC = (t) => F.DECIMAL(t, 2); F.OCT2DEC = (t) => F.DECIMAL(t, 8); F.HEX2DEC = (t) => F.DECIMAL(t, 16);
@@ -981,6 +1143,8 @@ function visibleCells(args, opts) {
       const r = x.r1 + i;
       const state = book && book.rowHidden ? book.rowHidden(x.sheet, r) : null;
       if ((state === 'filter' && opts.filtered) || (state === 'manual' && opts.manual)) continue;
+      // a row whose filter value is too heavy to compute: whether it is hidden is not known (see Engine.slowRead)
+      if (state === 'unknown' && opts.filtered) x.engine.slowRead();
       const row = [];
       for (let j = 0; j < x.cols; j++) {
         const raw = x.engine.raw(x.sheet, r, x.c1 + j);
@@ -1141,6 +1305,8 @@ F['BINOM.DIST'] = (k, n, p, cum) => {
   if (x < 0 || x > t || pr < 0 || pr > 1) return ERR['#NUM!'];
   const pmf = (i) => combin(t, i) * pr ** i * (1 - pr) ** (t - i);
   if (!boolArg(cum, false)) return pmf(x);
+  if (x > 1e6) return ERR['#NUM!'];
+  tick(x + 1);
   let s = 0; for (let i = 0; i <= x; i++) s += pmf(i); return s;
 };
 F.BINOMDIST = F['BINOM.DIST'];
@@ -1149,6 +1315,8 @@ F['POISSON.DIST'] = (x, m, cum) => {
   if (k < 0 || lambda < 0) return ERR['#NUM!'];
   const pmf = (i) => Math.exp(-lambda + i * Math.log(lambda || 1e-300) - lnGamma(i + 1));
   if (!boolArg(cum, false)) return pmf(k);
+  if (k > 1e6) return ERR['#NUM!'];
+  tick(k + 1);
   let s = 0; for (let i = 0; i <= k; i++) s += pmf(i); return s;
 };
 F.POISSON = F['POISSON.DIST'];
@@ -1162,7 +1330,13 @@ F['CONFIDENCE.NORM'] = (alpha, s, n) => normInv(1 - numArg(alpha) / 2) * numArg(
 F.FREQUENCY = (data, bins) => {
   const d = numbers([data]), b = numbers([bins]).sort((x, y) => x - y);
   const out = b.map(() => 0).concat([0]);
-  for (const x of d) { let i = 0; while (i < b.length && x > b[i]) i++; out[i]++; }
+  tick(d.length + b.length);
+  for (const x of d) {
+    // the first bin that is not smaller than x (binary search over the sorted bins)
+    let lo = 0, hi = b.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (x > b[mid]) lo = mid + 1; else hi = mid; }
+    out[lo]++;
+  }
   return out.map((x) => [x]);
 };
 F.PROB = (xs, ps, lo, hi) => { const a = numArg(lo), b = hi === undefined ? a : numArg(hi); return pairs(xs, ps).reduce((s, [x, p]) => (x >= a && x <= b ? s + p : s), 0); };
@@ -1192,11 +1366,22 @@ F.PPMT = (r, per, n, pv, fvv, type) => {
   const t = numArg(type, 0) ? 1 : 0;
   return pmtCalc(numArg(r), numArg(n), numArg(pv), numArg(fvv, 0), t) - ipmt(numArg(r), numArg(per), numArg(n), numArg(pv), numArg(fvv, 0), t);
 };
-F.CUMIPMT = (r, n, pv, s, e, type) => { let t = 0; for (let i = numArg(s); i <= numArg(e); i++) t += ipmt(numArg(r), i, numArg(n), numArg(pv), 0, numArg(type)); return t; };
+/** The whole periods start..end of CUMIPMT/CUMPRINC (Excel truncates them), or null when they are not valid. */
+function periods(s, e) {
+  const a = Math.trunc(numArg(s)), b = Math.trunc(numArg(e));
+  if (!(a >= 1 && b >= a && b <= 1e9)) return null;
+  tick(b - a + 1);
+  return [a, b];
+}
+F.CUMIPMT = (r, n, pv, s, e, type) => {
+  const se = periods(s, e); if (!se) return ERR['#NUM!'];
+  let t = 0; for (let i = se[0]; i <= se[1]; i++) t += ipmt(numArg(r), i, numArg(n), numArg(pv), 0, numArg(type)); return t;
+};
 F.CUMPRINC = (r, n, pv, s, e, type) => {
+  const se = periods(s, e); if (!se) return ERR['#NUM!'];
   let t = 0; const ty = numArg(type);
   const p = pmtCalc(numArg(r), numArg(n), numArg(pv), 0, ty);
-  for (let i = numArg(s); i <= numArg(e); i++) t += p - ipmt(numArg(r), i, numArg(n), numArg(pv), 0, ty);
+  for (let i = se[0]; i <= se[1]; i++) t += p - ipmt(numArg(r), i, numArg(n), numArg(pv), 0, ty);
   return t;
 };
 F.NPV = (r, ...vals) => { const rate = numArg(r); return numbers(vals).reduce((s, v, i) => s + v / Math.pow(1 + rate, i + 1), 0); };
@@ -1221,12 +1406,16 @@ F.SLN = (c, s, l) => { const life = numArg(l); return life === 0 ? ERR['#DIV/0!'
 F.SYD = (c, s, l, per) => { const life = numArg(l); return (numArg(c) - numArg(s)) * (life - numArg(per) + 1) * 2 / (life * (life + 1)); };
 F.DDB = (c, s, l, per, factor) => {
   const cost = numArg(c), salvage = numArg(s), life = numArg(l), p = numArg(per), f = numArg(factor, 2);
+  if (!(life > 0 && p > 0 && p <= life && p <= 1e9)) return ERR['#NUM!'];
+  tick(p);
   let book = cost, dep = 0;
   for (let i = 1; i <= p; i++) { dep = Math.min(book * f / life, Math.max(0, book - salvage)); book -= dep; }
   return dep;
 };
 F.DB = (c, s, l, per, month) => {
   const cost = numArg(c), salvage = numArg(s), life = numArg(l), p = numArg(per), m = numArg(month, 12);
+  if (!(life > 0 && p >= 1 && p <= life + 1 && p <= 1e9 && m >= 1 && m <= 12)) return ERR['#NUM!'];
+  tick(p);
   const rate = roundTo(1 - Math.pow(salvage / cost, 1 / life), 3, 'half');
   let total = 0, dep = cost * rate * m / 12;
   if (p === 1) return dep;
@@ -1323,12 +1512,18 @@ F.LET = (args, ev, ctx, engine) => {
 };
 
 // ---- text
-F.CONCAT = (...a) => { let s = ''; for (const { v } of flat(a)) { const t = toStr(v); if (isErr(t)) return t; s += t; } return s; };
-F.CONCATENATE = (...a) => { let s = ''; for (const x of a) { const t = toStr(x); if (isErr(t)) return t; s += t; } return s; };
+F.CONCAT = (...a) => { let s = ''; for (const { v } of flat(a)) { const t = toStr(v); if (isErr(t)) return t; s += t; if (longText(s)) return ERR['#VALUE!']; } return s; };
+F.CONCATENATE = (...a) => { let s = ''; for (const x of a) { const t = toStr(x); if (isErr(t)) return t; s += t; if (longText(s)) return ERR['#VALUE!']; } return s; };
 F.TEXTJOIN = (delim, ignoreEmpty, ...a) => {
   const d = strArg(delim), skip = boolArg(ignoreEmpty, true);
   const parts = [];
-  for (const { v } of flat(a)) { const t = toStr(v); if (isErr(t)) return t; if (skip && t === '') continue; parts.push(t); }
+  let len = 0;
+  for (const { v } of flat(a)) {
+    const t = toStr(v); if (isErr(t)) return t; if (skip && t === '') continue;
+    len += t.length + (parts.length ? d.length : 0);
+    if (len > MAX_TEXT) return ERR['#VALUE!'];
+    parts.push(t);
+  }
   return parts.join(d);
 };
 F.LEN = S1((s) => s.length);
@@ -1343,7 +1538,10 @@ F.CLEAN = S1((s) => s.replace(/[\x00-\x1f]/g, ''));
 F.SUBSTITUTE = L((t, from, to, nth) => {
   const s = strArg(t), a = strArg(from), b = strArg(to);
   if (!a) return s;
-  if (nth === undefined || nth === null) return s.split(a).join(b);
+  if (nth === undefined || nth === null) {
+    const parts = s.split(a);
+    return s.length + (parts.length - 1) * (b.length - a.length) > MAX_TEXT ? ERR['#VALUE!'] : parts.join(b);
+  }
   const k = numArg(nth); let idx = -1;
   for (let i = 0; i < k; i++) { idx = s.indexOf(a, idx + 1); if (idx < 0) return s; }
   return s.slice(0, idx) + b + s.slice(idx + a.length);
@@ -1352,11 +1550,20 @@ F.REPLACE = (t, start, n, by) => { const s = strArg(t), a = numArg(start), k = n
 F.FIND = L((needle, hay, start) => { const i = strArg(hay).indexOf(strArg(needle), numArg(start, 1) - 1); return i < 0 ? ERR['#VALUE!'] : i + 1; });
 F.SEARCH = L((needle, hay, start) => {
   const n = strArg(needle), h = strArg(hay), from = numArg(start, 1) - 1;
-  if (/[*?~]/.test(n)) { const re = new RegExp(wildcardRe(n).source.slice(1, -1), 'i'); const m = re.exec(h.slice(from)); return m ? m.index + from + 1 : ERR['#VALUE!']; }
+  if (/[*?~]/.test(n)) {
+    if (n.length > 255) return ERR['#VALUE!']; // Excel's limit for find_text
+    const i = wildcardFind(wildcardTokens(n), h, from);
+    return i < 0 ? ERR['#VALUE!'] : i + 1;
+  }
   const i = h.toLowerCase().indexOf(n.toLowerCase(), from);
   return i < 0 ? ERR['#VALUE!'] : i + 1;
 });
-F.REPT = (t, n) => { const k = numArg(n); return k < 0 ? ERR['#VALUE!'] : strArg(t).repeat(Math.floor(k)); };
+F.REPT = (t, n) => {
+  const s = strArg(t), k = Math.floor(numArg(n));
+  // the result may not be longer than Excel's text limit (checked before building it)
+  if (!(k >= 0) || (k > 0 && s.length * k > MAX_TEXT)) return ERR['#VALUE!'];
+  return s === '' ? '' : s.repeat(k);
+};
 F.EXACT = (a, b) => strArg(a) === strArg(b);
 F.CHAR = N1((x) => String.fromCharCode(x));
 F.UNICHAR = N1((x) => String.fromCodePoint(x));
@@ -1374,47 +1581,376 @@ F.NUMBERVALUE = (t, dec, grp) => {
 F.TEXT = L((v, fmt) => {
   const s = scalar(v);
   const n = typeof s === 'number' ? s : typeof s === 'string' ? textToNumber(s) : null;
-  return formatWithPattern(n === null || n === undefined ? toStr(s) : n, strArg(fmt), F._locale);
+  const pat = strArg(fmt);
+  if (pat.length > 255) return ERR['#VALUE!']; // Excel's limit for a format
+  return formatWithPattern(n === null || n === undefined ? toStr(s) : n, pat, F._locale);
 });
-F.DOLLAR = (x, d) => { const k = numArg(d, 2); return formatWithPattern(roundTo(numArg(x), k, 'half'), '$#,##0' + (k > 0 ? '.' + '0'.repeat(k) : '') + ';($#,##0' + (k > 0 ? '.' + '0'.repeat(k) : '') + ')', 'en-US'); };
-F.FIXED = (x, d, noCommas) => { const k = numArg(d, 2); return formatWithPattern(roundTo(numArg(x), k, 'half'), (boolArg(noCommas, false) ? '0' : '#,##0') + (k > 0 ? '.' + '0'.repeat(k) : ''), 'en-US'); };
+F.DOLLAR = (x, d) => { const k = numArg(d, 2); if (!(k <= 127)) return ERR['#VALUE!']; return formatWithPattern(roundTo(numArg(x), k, 'half'), '$#,##0' + (k > 0 ? '.' + '0'.repeat(k) : '') + ';($#,##0' + (k > 0 ? '.' + '0'.repeat(k) : '') + ')', 'en-US'); };
+F.FIXED = (x, d, noCommas) => { const k = numArg(d, 2); if (!(k <= 127)) return ERR['#VALUE!']; return formatWithPattern(roundTo(numArg(x), k, 'half'), (boolArg(noCommas, false) ? '0' : '#,##0') + (k > 0 ? '.' + '0'.repeat(k) : ''), 'en-US'); };
 F.T = (a) => { const v = scalar(a); return typeof v === 'string' ? v : ''; };
 F.N = (a) => { const v = scalar(a); return typeof v === 'number' ? v : typeof v === 'boolean' ? (v ? 1 : 0) : isErr(v) ? v : 0; };
-F.TEXTBEFORE = (t, d, inst) => { const s = strArg(t), dl = strArg(d), n = numArg(inst, 1); let i = -1; for (let k = 0; k < n; k++) { i = s.indexOf(dl, i + 1); if (i < 0) return ERR['#N/A']; } return s.slice(0, i); };
-F.TEXTAFTER = (t, d, inst) => { const s = strArg(t), dl = strArg(d), n = numArg(inst, 1); let i = -1; for (let k = 0; k < n; k++) { i = s.indexOf(dl, i + 1); if (i < 0) return ERR['#N/A']; } return s.slice(i + dl.length); };
+// the instance can be at most one more than the length of the text (an empty delimiter is found after every character)
+const badInstance = (n, s) => n === 0 || !(Math.abs(n) <= s.length + 1);
+F.TEXTBEFORE = (t, d, inst) => { const s = strArg(t), dl = strArg(d), n = numArg(inst, 1); if (badInstance(n, s)) return ERR['#VALUE!']; let i = -1; for (let k = 0; k < n; k++) { i = s.indexOf(dl, i + 1); if (i < 0) return ERR['#N/A']; } return s.slice(0, i); };
+F.TEXTAFTER = (t, d, inst) => { const s = strArg(t), dl = strArg(d), n = numArg(inst, 1); if (badInstance(n, s)) return ERR['#VALUE!']; let i = -1; for (let k = 0; k < n; k++) { i = s.indexOf(dl, i + 1); if (i < 0) return ERR['#N/A']; } return s.slice(i + dl.length); };
 F.TEXTSPLIT = (t, colDelim, rowDelim, ignoreEmpty) => {
   const s = strArg(t), cd = colDelim === null || colDelim === undefined ? null : strArg(colDelim), rd = rowDelim === undefined || rowDelim === null ? null : strArg(rowDelim);
   const skip = boolArg(ignoreEmpty, false);
   const rows = (rd ? s.split(rd) : [s]).filter((r) => !skip || r !== '');
   const m = rows.map((r) => (cd ? r.split(cd) : [r]).filter((x) => !skip || x !== ''));
-  const w = Math.max(...m.map((r) => r.length));
+  const w = m.reduce((x, r) => Math.max(x, r.length), 0);
+  if (!w) return ERR['#CALC!'];
+  arraySize(m.length, w);
   return m.map((r) => r.concat(Array(w - r.length).fill(ERR['#N/A'])));
 };
 F.VALUETOTEXT = (v) => toStr(v);
 F.ARRAYTOTEXT = (a, format) => {
-  const m = toMatrix(a);
-  if (numArg(format, 0)) return '{' + m.map((r) => r.map((x) => (typeof x === 'string' ? `"${x}"` : toStr(x))).join(',')).join(';') + '}';
-  return m.map((r) => r.map(toStr).join(', ')).join(', ');
+  const m = toMatrix(a), strict = numArg(format, 0);
+  let len = 0;
+  const text = (x) => {
+    const s = strict && typeof x === 'string' ? `"${x}"` : toStr(x);
+    if (isErr(s)) return s.code;
+    if ((len += s.length + 2) > MAX_TEXT) throw ERR['#VALUE!'];
+    return s;
+  };
+  if (strict) return '{' + m.map((r) => r.map(text).join(',')).join(';') + '}';
+  return m.map((r) => r.map(text).join(', ')).join(', ');
 };
-function userRegex(pattern, flags) {
-  try { return new RegExp(strArg(pattern), flags); } catch (e) { throw ERR['#VALUE!']; }
+/*
+ * Regular expressions typed in formulas (REGEXTEST, REGEXEXTRACT, REGEXREPLACE) run on a small matcher that follows
+ * all ways through the pattern at once (a Pike VM), not on the browser's backtracking engine, so that no pattern can
+ * take exponential time: the cost is at most text length x pattern size, and it counts against the work budget.
+ * It reads patterns as JavaScript does and finds the same matches: classes, groups, alternatives, greedy and lazy
+ * quantifiers, anchors, \b, and groups that switch the i, m and s flags, such as (?i:abc) and (?-i:a). Back references
+ * and lookarounds, which need backtracking, give #VALUE!, like patterns over 1000 characters and patterns that take
+ * more than 20000 steps to match one character (such as a{30000}).
+ */
+const RX_MAX = 1000, RX_PROG = 20000;
+const rxCache = new Map();
+const isWordCh = (c) => c !== undefined && /[A-Za-z0-9_]/.test(c);
+/** Whether a character ends a line for ".", "^" and "$" (the line terminators of JavaScript). */
+const isLineEnd = (c) => { const k = c === undefined ? -1 : c.charCodeAt(0); return k === 10 || k === 13 || k === 0x2028 || k === 0x2029; };
+const ANCHORS = new Set(['bol', 'eol', 'mbol', 'meol', 'wb']);
+/* The characters that are equal without case (canon gives them the same value), for each character that has such
+ * others: a case-insensitive class matches a character when it holds one of them, as in JavaScript (so "ς" is in [σ],
+ * and "ı" is not in [A-Z], because "ı" and "I" are not equal without case). Made once, when first needed. */
+let caseGroups = null;
+function caseGroup(ch) {
+  if (!caseGroups) {
+    const byCanon = new Map();
+    for (let k = 0; k < 0x10000; k++) {
+      const x = String.fromCharCode(k), key = canon(x), g = byCanon.get(key);
+      if (g) g.push(x); else byCanon.set(key, [x]);
+    }
+    caseGroups = new Map();
+    for (const g of byCanon.values()) if (g.length > 1) for (const x of g) caseGroups.set(x, g);
+  }
+  return caseGroups.get(ch) || null;
 }
-F.REGEXTEST = L((t, p, cs) => userRegex(p, numArg(cs, 0) ? 'i' : '').test(strArg(t)));
+function rxCompile(p, icase) {
+  // icase, dotAll and multi are the flags at the current place in the pattern: (?ims-ims:…) groups change them
+  let i = 0, ncap = 0, dotAll = false, multi = false;
+  const names = Object.create(null);
+  const fail = () => { throw ERR['#VALUE!']; };
+  const lit = (ch) => { const cc = canon(ch); return { t: 'char', ch, test: icase ? (c) => canon(c) === cc : (c) => c === ch }; };
+  const set = (test) => ({ t: 'char', test });
+  const quantAt = (k) => /^\{(\d+)(,(\d*))?\}/.exec(p.slice(k, k + 24));
+  function escape(inClass) {
+    const ch = p[i++];
+    switch (ch) {
+      case undefined: return fail();
+      case 'd': return set((c) => c >= '0' && c <= '9');
+      case 'D': return set((c) => !(c >= '0' && c <= '9'));
+      case 'w': return set(isWordCh);
+      case 'W': return set((c) => !isWordCh(c));
+      case 's': return set((c) => /\s/.test(c));
+      case 'S': return set((c) => !/\s/.test(c));
+      case 'b': return inClass ? lit('\b') : { t: 'wb', neg: false };
+      case 'B': return inClass ? lit('B') : { t: 'wb', neg: true };
+      case 't': return lit('\t');
+      case 'n': return lit('\n');
+      case 'r': return lit('\r');
+      case 'f': return lit('\f');
+      case 'v': return lit('\v');
+      case '0': return /\d/.test(p[i] || '') ? fail() : lit('\0');
+      case 'x': case 'u': {
+        const len = ch === 'x' ? 2 : 4, hex = p.slice(i, i + len);
+        if (!new RegExp('^[0-9a-fA-F]{' + len + '}$').test(hex)) return lit(ch);
+        i += len;
+        return lit(String.fromCharCode(parseInt(hex, 16)));
+      }
+      case 'c': return /[A-Za-z]/.test(p[i] || '') ? lit(String.fromCharCode(p[i++].charCodeAt(0) % 32)) : fail();
+      case 'k': return fail(); // a back reference to a named group
+      default: return /[1-9]/.test(ch) ? fail() : lit(ch); // back references are not supported
+    }
+  }
+  function cls() {
+    let neg = false;
+    if (p[i] === '^') { neg = true; i++; }
+    const tests = [];
+    const one = () => {
+      const ch = p[i++];
+      if (ch !== '\\') return { ch, test: (c) => c === ch };
+      const e = escape(true);
+      return e.ch !== undefined ? { ch: e.ch, test: (c) => c === e.ch } : { test: e.test };
+    };
+    while (i < p.length && p[i] !== ']') {
+      const a = one();
+      if (p[i] === '-' && i + 1 < p.length && p[i + 1] !== ']') {
+        i++;
+        const b = one();
+        if (a.ch === undefined || b.ch === undefined) tests.push(a.test, (c) => c === '-', b.test); // [\d-z]: "-" stands for itself
+        else { if (a.ch > b.ch) fail(); tests.push((c) => c >= a.ch && c <= b.ch); }
+      } else tests.push(a.test);
+    }
+    if (p[i++] !== ']') fail();
+    const any = (c) => tests.some((t) => t(c));
+    // without case: the class holds the character or one that is equal to it without case
+    const test = icase ? (c) => { const g = caseGroup(c); return g ? g.some(any) : any(c); } : any;
+    return set(neg ? (c) => !test(c) : test);
+  }
+  function atom() {
+    const ch = p[i++];
+    switch (ch) {
+      case '(': {
+        let cap = 0;
+        const flags = [icase, dotAll, multi];
+        if (p[i] === '?') {
+          // (?:...), (?<name>...), or a group that switches flags: (?i:...), (?-i:...), (?ms-i:...)
+          const m = /^\?(?::|<([A-Za-z_$][\w$]*)>|([ims]*)(?:-([ims]*))?:)/.exec(p.slice(i, i + 40));
+          if (!m) fail(); // lookarounds
+          i += m[0].length;
+          if (m[1]) { cap = ++ncap; names[m[1]] = cap; }
+          if (m[2] !== undefined) {
+            const on = m[2], all = on + (m[3] || '');
+            // as in JavaScript: each flag at most once, and at least one flag
+            if (!all || new Set(all).size !== all.length) fail();
+            for (const f of all) { if (f === 'i') icase = on.includes(f); else if (f === 's') dotAll = on.includes(f); else multi = on.includes(f); }
+          }
+        } else cap = ++ncap;
+        const node = alt();
+        [icase, dotAll, multi] = flags; // the flags of a group end with it
+        if (p[i++] !== ')') fail();
+        return { t: 'group', node, cap };
+      }
+      case '[': return cls();
+      case '.': return set(dotAll ? () => true : (c) => !isLineEnd(c));
+      case '^': return { t: multi ? 'mbol' : 'bol' };
+      case '$': return { t: multi ? 'meol' : 'eol' };
+      case '\\': return escape(false);
+      case '*': case '+': case '?': case ')': return fail();
+      case '{': return quantAt(i - 1) ? fail() : lit(ch);
+      default: return lit(ch);
+    }
+  }
+  function quant(node) {
+    let min, max;
+    const ch = p[i];
+    if (ch === '*') { min = 0; max = Infinity; i++; }
+    else if (ch === '+') { min = 1; max = Infinity; i++; }
+    else if (ch === '?') { min = 0; max = 1; i++; }
+    else if (ch === '{' && quantAt(i)) {
+      const m = quantAt(i);
+      min = +m[1]; max = !m[2] ? min : m[3] === '' ? Infinity : +m[3];
+      // any count, as in JavaScript: the size of the compiled pattern (RX_PROG) limits what a count can cost
+      if (min > max) fail();
+      i += m[0].length;
+    } else return node;
+    let greedy = true;
+    if (p[i] === '?') { greedy = false; i++; }
+    if (p[i] === '*' || p[i] === '+' || p[i] === '?' || (p[i] === '{' && quantAt(i))) fail(); // nothing to repeat
+    if (ANCHORS.has(node.t)) fail(); // nothing to repeat, as in JavaScript
+    return { t: 'rep', node, min, max, greedy };
+  }
+  function cat() {
+    const items = [];
+    while (i < p.length && p[i] !== '|' && p[i] !== ')') items.push(quant(atom()));
+    return { t: 'cat', items };
+  }
+  function alt() {
+    const alts = [cat()];
+    while (p[i] === '|') { i++; alts.push(cat()); }
+    return alts.length === 1 ? alts[0] : { t: 'alt', alts };
+  }
+  const root = alt();
+  if (i < p.length) fail(); // an unmatched ")"
+  // compile to instructions: c (one character), p (split, x first), j (jump), s (save a position), a (assert), m (match)
+  const prog = [];
+  const emit = (ins) => { if (prog.length >= RX_PROG) fail(); prog.push(ins); return ins; };
+  // whether a part compiles to no instructions (an empty group, a{0}): repeated any number of times it adds nothing,
+  // so a count such as (?:){1000000000} costs no time
+  const empty = (n) => {
+    if (n.e === undefined) n.e = n.t === 'cat' ? n.items.every(empty) : n.t === 'group' ? !n.cap && empty(n.node) : n.t === 'rep' ? n.max === 0 || empty(n.node) : false;
+    return n.e;
+  };
+  function gen(n) {
+    switch (n.t) {
+      case 'char': emit({ op: 'c', test: n.test }); break;
+      case 'bol': case 'eol': case 'mbol': case 'meol': emit({ op: 'a', kind: n.t }); break;
+      case 'wb': emit({ op: 'a', kind: n.neg ? 'nwb' : 'wb' }); break;
+      case 'cat': n.items.forEach(gen); break;
+      case 'group':
+        if (n.cap) emit({ op: 's', n: 2 * n.cap });
+        gen(n.node);
+        if (n.cap) emit({ op: 's', n: 2 * n.cap + 1 });
+        break;
+      case 'alt': {
+        const jumps = [];
+        n.alts.forEach((a, k) => {
+          if (k === n.alts.length - 1) { gen(a); return; }
+          const sp = emit({ op: 'p' });
+          sp.x = prog.length; gen(a);
+          jumps.push(emit({ op: 'j' }));
+          sp.y = prog.length;
+        });
+        jumps.forEach((j) => { j.x = prog.length; });
+        break;
+      }
+      default: { // rep
+        if (empty(n.node)) break;
+        for (let k = 0; k < n.min; k++) gen(n.node);
+        const loop = n.max === Infinity;
+        const splits = [];
+        for (let k = n.min; k < (loop ? n.min + 1 : n.max); k++) {
+          const sp = emit({ op: 'p' }), at = prog.length - 1;
+          splits.push([sp, prog.length]);
+          gen(n.node);
+          if (loop) emit({ op: 'j', x: at });
+        }
+        splits.forEach(([sp, body]) => { sp.x = n.greedy ? body : prog.length; sp.y = n.greedy ? prog.length : body; });
+      }
+    }
+  }
+  emit({ op: 's', n: 0 }); gen(root); emit({ op: 's', n: 1 }); emit({ op: 'm' });
+  return { prog, ncap, names };
+}
+function rxAssert(kind, s, pos) {
+  if (kind === 'bol') return pos === 0;
+  if (kind === 'eol') return pos === s.length;
+  // with the m flag, also at the start and the end of each line
+  if (kind === 'mbol') return pos === 0 || isLineEnd(s[pos - 1]);
+  if (kind === 'meol') return pos === s.length || isLineEnd(s[pos]);
+  const b = isWordCh(s[pos - 1]) !== isWordCh(s[pos]);
+  return kind === 'wb' ? b : !b;
+}
+/** The first match at or after `from`: [start, end, group 1 start, group 1 end, …] (-1 for no group), or null. */
+function rxExec(rx, s, from) {
+  const prog = rx.prog, mark = new Int32Array(prog.length), init = new Array(2 * rx.ncap + 2).fill(-1);
+  let stamp = 1, match = null;
+  // adds the threads reachable from pc without reading a character, in priority order
+  const add = (list, pc0, caps0, pos) => {
+    const stack = [pc0, caps0];
+    while (stack.length) {
+      const caps = stack.pop(), pc = stack.pop();
+      if (mark[pc] === stamp) continue;
+      mark[pc] = stamp;
+      const ins = prog[pc];
+      if (ins.op === 'j') stack.push(ins.x, caps);
+      else if (ins.op === 'p') stack.push(ins.y, caps, ins.x, caps);
+      else if (ins.op === 's') { const c = caps.slice(); c[ins.n] = pos; stack.push(pc + 1, c); }
+      else if (ins.op === 'a') { if (rxAssert(ins.kind, s, pos)) stack.push(pc + 1, caps); }
+      else list.push(pc, caps);
+    }
+  };
+  let list = [];
+  add(list, 0, init, from);
+  for (let pos = from; pos <= s.length; pos++) {
+    tick(list.length / 2 + 1);
+    stamp++;
+    const next = [], c = s[pos];
+    for (let k = 0; k < list.length; k += 2) {
+      const ins = prog[list[k]];
+      if (ins.op === 'm') { match = list[k + 1]; break; } // threads after this one have lower priority
+      if (c !== undefined && ins.test(c)) add(next, list[k] + 1, list[k + 1], pos + 1);
+    }
+    if (!match && pos < s.length) add(next, 0, init, pos + 1); // a match starting one character later
+    if (match && !next.length) break;
+    list = next;
+  }
+  return match;
+}
+function userRegex(pattern, icase) {
+  const p = strArg(pattern);
+  if (p.length > RX_MAX) throw ERR['#VALUE!'];
+  const key = (icase ? 'i' : 'c') + p;
+  let rx = rxCache.get(key);
+  if (!rx) {
+    rx = rxCompile(p, icase);
+    if (rxCache.size > 200) rxCache.clear();
+    rxCache.set(key, rx);
+  }
+  return rx;
+}
+function regexText(t) {
+  const s = strArg(t);
+  if (longText(s)) throw ERR['#VALUE!'];
+  return s;
+}
+/** All matches, each as its capture positions (empty matches move on by one character, as in JavaScript). */
+function rxAll(rx, s, limit) {
+  const out = [];
+  for (let pos = 0; pos <= s.length && out.length < limit;) {
+    const m = rxExec(rx, s, pos);
+    if (!m) break;
+    out.push(m);
+    pos = m[1] > m[0] ? m[1] : m[1] + 1;
+  }
+  return out;
+}
+/** A replacement text with $&, $1…$99, $<name>, $`, $' and $$ filled in, as String.replace does. */
+function rxExpand(repl, rx, s, m) {
+  const group = (k) => (m[2 * k] < 0 ? '' : s.slice(m[2 * k], m[2 * k + 1]));
+  let out = '';
+  for (let i = 0; i < repl.length; i++) {
+    const ch = repl[i], nx = repl[i + 1];
+    if (ch !== '$' || nx === undefined) { out += ch; continue; }
+    if (nx === '$') { out += '$'; i++; }
+    else if (nx === '&') { out += group(0); i++; }
+    else if (nx === '`') { out += s.slice(0, m[0]); i++; }
+    else if (nx === "'") { out += s.slice(m[1]); i++; }
+    else if (/\d/.test(nx)) {
+      const two = +(nx + (repl[i + 2] || 'x'));
+      if (two >= 1 && two <= rx.ncap) { out += group(two); i += 2; }
+      else if (+nx >= 1 && +nx <= rx.ncap) { out += group(+nx); i++; }
+      else out += ch;
+    } else if (nx === '<' && Object.keys(rx.names).length) {
+      const end = repl.indexOf('>', i + 2);
+      if (end < 0) { out += ch; continue; }
+      const k = rx.names[repl.slice(i + 2, end)];
+      if (k) out += group(k);
+      i = end;
+    } else out += ch;
+    if (longText(out)) throw ERR['#VALUE!'];
+  }
+  return out;
+}
+F.REGEXTEST = L((t, p, cs) => rxExec(userRegex(p, !!numArg(cs, 0)), regexText(t), 0) !== null);
 F.REGEXEXTRACT = (t, p, mode, cs) => {
-  const s = strArg(t), md = numArg(mode, 0), flags = (numArg(cs, 0) ? 'i' : '') + (md === 1 ? 'g' : '');
-  const re = userRegex(p, flags);
-  if (md === 1) { const all = s.match(re); return all ? all.map((x) => [x]) : ERR['#N/A']; }
-  const m = re.exec(s);
+  const s = regexText(t), md = numArg(mode, 0);
+  const rx = userRegex(p, !!numArg(cs, 0));
+  if (md === 1) {
+    const all = rxAll(rx, s, MAX_CELLS);
+    return all.length ? all.map((m) => [s.slice(m[0], m[1])]) : ERR['#N/A'];
+  }
+  const m = rxExec(rx, s, 0);
   if (!m) return ERR['#N/A'];
-  return md === 2 ? [m.slice(1)] : m[0];
+  if (md !== 2) return s.slice(m[0], m[1]);
+  const groups = [];
+  for (let k = 1; k <= rx.ncap; k++) groups.push(m[2 * k] < 0 ? undefined : s.slice(m[2 * k], m[2 * k + 1]));
+  return [groups];
 };
 F.REGEXREPLACE = (t, p, r, occ, cs) => {
-  const n = numArg(occ, 0), flags = (numArg(cs, 0) ? 'i' : '') + 'g';
-  const re = userRegex(p, flags);
-  const repl = strArg(r).replace(/\$(\d)/g, '$$$1');
-  if (!n) return strArg(t).replace(re, repl);
-  let i = 0;
-  return strArg(t).replace(re, (...m) => (++i === n ? m[0].replace(new RegExp(re.source, flags.replace('g', '')), repl) : m[0]));
+  const s = regexText(t), n = numArg(occ, 0), repl = strArg(r);
+  const rx = userRegex(p, !!numArg(cs, 0));
+  const all = rxAll(rx, s, n > 0 ? n : MAX_CELLS);
+  let out = '', last = 0;
+  all.forEach((m, k) => {
+    if (n && k + 1 !== n) return;
+    out += s.slice(last, m[0]) + rxExpand(repl, rx, s, m);
+    last = m[1];
+    if (longText(out)) throw ERR['#VALUE!'];
+  });
+  return out + s.slice(last);
 };
 
 // ---- date & time
@@ -1505,18 +2041,31 @@ function weekendMask(w) {
   const map = { 1: [6, 0], 2: [0, 1], 3: [1, 2], 4: [2, 3], 5: [3, 4], 6: [4, 5], 7: [5, 6], 11: [0], 12: [1], 13: [2], 14: [3], 15: [4], 16: [5], 17: [6] };
   return map[toNum(v)] || [6, 0];
 }
+// dates are serials 0..2958465 (31 Dec 9999); serial 0 is a Saturday
+const MAX_DATE = 2958465;
+const validDate = (s) => s >= 0 && s <= MAX_DATE;
+const weekday = (s) => (((s + 6) % 7) + 7) % 7;
 function networkdays(start, end, weekend, holidays) {
   let a = Math.floor(numArg(start)), b = Math.floor(numArg(end)), sign = 1;
+  if (!validDate(a) || !validDate(b)) return ERR['#NUM!'];
   if (a > b) { [a, b] = [b, a]; sign = -1; }
   const hol = holidaySet(holidays), we = weekendMask(weekend);
+  tick(b - a + 1);
   let c = 0;
-  for (let s = a; s <= b; s++) if (!we.includes(serialToParts(s).dow) && !hol.has(s)) c++;
+  for (let s = a; s <= b; s++) if (!we.includes(weekday(s)) && !hol.has(s)) c++;
   return sign * c;
 }
 function workday(start, days, weekend, holidays) {
   let s = Math.floor(numArg(start)), n = Math.trunc(numArg(days));
+  if (!validDate(s) || !(Math.abs(n) <= MAX_DATE)) return ERR['#NUM!'];
   const hol = holidaySet(holidays), we = weekendMask(weekend), step = n < 0 ? -1 : 1;
-  while (n !== 0) { s += step; if (!we.includes(serialToParts(s).dow) && !hol.has(s)) n -= step; }
+  if (we.length >= 7) return ERR['#VALUE!']; // every day is a weekend day
+  while (n !== 0) {
+    s += step;
+    if (!validDate(s)) return ERR['#NUM!'];
+    tick(1);
+    if (!we.includes(weekday(s)) && !hol.has(s)) n -= step;
+  }
   return s;
 }
 F.NETWORKDAYS = (s, e, h) => networkdays(s, e, undefined, h);
@@ -1535,6 +2084,7 @@ function exactMatch(a, b) {
 function lookupIndex(value, vec, exact, approxMode) {
   const v = scalar(value);
   if (isErr(v)) throw v;
+  tick(vec.length);
   if (exact) {
     const f = typeof v === 'string' && /[*?~]/.test(v) ? makeCriteria(v) : null;
     for (let i = 0; i < vec.length; i++) if (f ? f(vec[i]) : exactMatch(vec[i], v)) return i;
@@ -1555,8 +2105,8 @@ function lookupIndex(value, vec, exact, approxMode) {
   }
   return found;
 }
-function columnOf(r, j) { const [rows] = rangeSize(r); const out = []; for (let i = 0; i < rows; i++) out.push(rangeGet(r, i, j)); return out; }
-function rowOf(r, i) { const [, cols] = rangeSize(r); const out = []; for (let j = 0; j < cols; j++) out.push(rangeGet(r, i, j)); return out; }
+function columnOf(r, j) { const [rows] = rangeSize(r); tick(rows); const out = []; for (let i = 0; i < rows; i++) out.push(rangeGet(r, i, j)); return out; }
+function rowOf(r, i) { const [, cols] = rangeSize(r); tick(cols); const out = []; for (let j = 0; j < cols; j++) out.push(rangeGet(r, i, j)); return out; }
 F.VLOOKUP = L((value, table, colNum, approx) => {
   const k = Math.floor(numArg(colNum)); const [rows, cols] = rangeSize(table);
   if (k < 1 || k > cols || !rows) return ERR['#REF!'];
@@ -1587,6 +2137,7 @@ F.XMATCH = L((value, vec, mode, searchMode) => {
 });
 function xIndex(value, list, mode, searchMode) {
   const v = scalar(value);
+  tick(list.length);
   const order = searchMode === -1 || searchMode === -2 ? list.map((_, i) => list.length - 1 - i) : list.map((_, i) => i);
   if (mode === 0 || mode === 2) {
     const f = mode === 2 && typeof v === 'string' ? makeCriteria(v) : null;
@@ -1605,11 +2156,28 @@ function xIndex(value, list, mode, searchMode) {
   return best;
 }
 F.XLOOKUP = (value, lookup, ret, notFound, matchMode, searchMode) => {
-  if (isMulti(value)) return mapMatrix(toMatrix(value), (v) => scalar(F.XLOOKUP(v, lookup, ret, notFound, matchMode, searchMode)));
   const [rows, cols] = rangeSize(lookup);
   const vertical = cols === 1 && rows >= 1;
+  // the lookup vector is read once, also when many values are looked up
   const list = vertical ? columnOf(lookup, 0) : rowOf(lookup, 0);
-  const i = xIndex(value, list, numArg(matchMode, 0), numArg(searchMode, 1));
+  const mode = numArg(matchMode, 0), search = numArg(searchMode, 1);
+  const one = (v) => xlookupResult(ret, vertical, xIndex(v, list, mode, search), notFound);
+  if (!isMulti(value)) return one(value);
+  if (mode !== 0) return mapMatrix(toMatrix(value), (v) => scalar(one(v)));
+  // many exact lookups: index the lookup vector once (the first match, or the last one when searching backwards)
+  const index = new Map();
+  list.forEach((x, i) => { const k = exactKey(x); if (k !== null && (search < 0 || !index.has(k))) index.set(k, i); });
+  return mapMatrix(toMatrix(value), (v) => {
+    const k = exactKey(scalar(v));
+    return scalar(xlookupResult(ret, vertical, k !== null && index.has(k) ? index.get(k) : -1, notFound));
+  });
+};
+/** A key under which exactMatch finds a value (text without case), or null for values it never matches. */
+function exactKey(x) {
+  if (x === null || x === undefined || (typeof x === 'number' && x !== x)) return null;
+  return typeof x === 'string' ? 's' + x.toLowerCase() : isErr(x) ? 'e' + x.code : typeof x + ':' + x;
+}
+function xlookupResult(ret, vertical, i, notFound) {
   if (i < 0) return notFound !== undefined && notFound !== null ? notFound : ERR['#N/A'];
   if (ret instanceof Range) {
     return vertical ? new Range(ret.engine, ret.sheet, ret.r1 + i, ret.c1, ret.r1 + i, ret.c2)
@@ -1668,7 +2236,10 @@ F.OFFSET = (args, ev) => {
   if ([dr, dc, h, w].some(isErr)) return ERR['#VALUE!'];
   const r1 = base.r1 + Math.trunc(dr), c1 = base.c1 + Math.trunc(dc);
   if (r1 < 0 || c1 < 0 || h < 1 || w < 1) return ERR['#REF!'];
-  return new Range(base.engine, base.sheet, r1, c1, r1 + Math.trunc(h) - 1, c1 + Math.trunc(w) - 1);
+  const r2 = r1 + Math.trunc(h) - 1, c2 = c1 + Math.trunc(w) - 1;
+  // past the last row or column of a worksheet is #REF!, as in Excel; the rest is cut to the sheet like A:A
+  if (!(r2 <= MAX_ROW && c2 <= MAX_COL)) return ERR['#REF!'];
+  return base.engine.clip(base.sheet, r1, c1, r2, c2);
 };
 F.INDIRECT = (args, ev, ctx, engine) => {
   const t = toStr(ev(args[0]));
@@ -1688,7 +2259,7 @@ F.INDIRECT = (args, ev, ctx, engine) => {
 };
 F.ADDRESS = (row, col, absNum, a1, sheet) => {
   const r = Math.floor(numArg(row)), c = Math.floor(numArg(col)), abs = numArg(absNum, 1), style = boolArg(a1, true);
-  if (r < 1 || c < 1) return ERR['#VALUE!'];
+  if (!(r >= 1 && c >= 1 && r <= MAX_ROW + 1 && c <= MAX_COL + 1)) return ERR['#VALUE!']; // inside a worksheet, as in Excel
   const sh = sheet !== undefined && sheet !== null ? quoteSheet(strArg(sheet)) + '!' : '';
   if (!style) return sh + 'R' + (abs === 1 || abs === 2 ? r : `[${r}]`) + 'C' + (abs === 1 || abs === 3 ? c : `[${c}]`);
   return sh + (abs === 1 || abs === 3 ? '$' : '') + colName(c - 1) + (abs === 1 || abs === 2 ? '$' : '') + r;
@@ -1697,8 +2268,9 @@ F.HYPERLINK = (args, ev, ctx, engine) => {
   const url = toStr(ev(args[0]));
   if (isErr(url)) return url;
   const label = args.length > 1 ? scalar(ev(args[1])) : url;
-  // only web and mail links open from a cell (no javascript: or data: URLs)
-  if (ctx.sheet && /^(https?:\/\/|mailto:)/i.test(String(url).trim())) engine.links.set(ctx.sheet.id + '|' + ctx.r + '|' + ctx.c, String(url).trim());
+  // only web and mail links open from a cell (no javascript: or data: URLs), and only the cell's own formula sets
+  // its link: not conditional formatting, validation or a defined name evaluated for that cell
+  if (ctx.cell && ctx.sheet && /^(https?:\/\/|mailto:)/i.test(String(url).trim())) engine.links.set(ctx.sheet.id + '|' + ctx.r + '|' + ctx.c, String(url).trim());
   return label;
 };
 F.FORMULATEXT = (args, ev, ctx, engine) => {
@@ -1752,6 +2324,7 @@ F.UNIQUE = (a, byCol, once) => {
   return cols ? F.TRANSPOSE(out) : out;
 };
 function sortRows(m, keys) {
+  tick(m.length * Math.ceil(Math.log2(m.length + 1)) * keys.length);
   return m.map((r, i) => ({ r, i })).sort((x, y) => {
     for (const { get, order } of keys) {
       const c = compare(get(x), get(y));
@@ -1792,8 +2365,8 @@ F.FILTER = (a, include, ifEmpty) => {
   if (!out.length) return ifEmpty !== undefined && ifEmpty !== null ? ifEmpty : ERR['#CALC!'];
   return out;
 };
-F.VSTACK = (...a) => { const ms = a.map(toMatrix); const w = Math.max(...ms.map((m) => m[0].length)); return ms.flatMap((m) => m.map((r) => r.concat(Array(w - r.length).fill(ERR['#N/A'])))); };
-F.HSTACK = (...a) => { const ms = a.map(toMatrix); const h = Math.max(...ms.map((m) => m.length)); return Array.from({ length: h }, (_, i) => ms.flatMap((m) => m[i] || Array(m[0].length).fill(ERR['#N/A']))); };
+F.VSTACK = (...a) => { const ms = a.map(toMatrix); const w = Math.max(...ms.map((m) => m[0].length)); arraySize(ms.reduce((n, m) => n + m.length, 0), w); return ms.flatMap((m) => m.map((r) => r.concat(Array(w - r.length).fill(ERR['#N/A'])))); };
+F.HSTACK = (...a) => { const ms = a.map(toMatrix); const h = Math.max(...ms.map((m) => m.length)); arraySize(h, ms.reduce((n, m) => n + m[0].length, 0)); return Array.from({ length: h }, (_, i) => ms.flatMap((m) => m[i] || Array(m[0].length).fill(ERR['#N/A']))); };
 F.TAKE = (a, rows, cols) => {
   let m = toMatrix(a);
   if (rows !== undefined && rows !== null) { const n = Math.trunc(numArg(rows)); m = n >= 0 ? m.slice(0, n) : m.slice(n); }
@@ -1806,13 +2379,13 @@ F.DROP = (a, rows, cols) => {
   if (cols !== undefined && cols !== null) { const n = Math.trunc(numArg(cols)); m = m.map((r) => (n >= 0 ? r.slice(n) : r.slice(0, n))); }
   return m.length && m[0].length ? m : ERR['#CALC!'];
 };
-F.CHOOSECOLS = (a, ...idx) => { const m = toMatrix(a); const w = m[0].length; const ks = numbers(idx).map((k) => (k < 0 ? w + k : k - 1)); if (ks.some((k) => k < 0 || k >= w)) return ERR['#VALUE!']; return m.map((r) => ks.map((k) => r[k])); };
-F.CHOOSEROWS = (a, ...idx) => { const m = toMatrix(a); const h = m.length; const ks = numbers(idx).map((k) => (k < 0 ? h + k : k - 1)); if (ks.some((k) => k < 0 || k >= h)) return ERR['#VALUE!']; return ks.map((k) => m[k]); };
+F.CHOOSECOLS = (a, ...idx) => { const m = toMatrix(a); const w = m[0].length; const ks = numbers(idx).map((k) => (k < 0 ? w + k : k - 1)); if (ks.some((k) => k < 0 || k >= w)) return ERR['#VALUE!']; arraySize(m.length, ks.length); return m.map((r) => ks.map((k) => r[k])); };
+F.CHOOSEROWS = (a, ...idx) => { const m = toMatrix(a); const h = m.length; const ks = numbers(idx).map((k) => (k < 0 ? h + k : k - 1)); if (ks.some((k) => k < 0 || k >= h)) return ERR['#VALUE!']; arraySize(ks.length, m[0].length); return ks.map((k) => m[k]); };
 F.TOCOL = (a, ignore, byCol) => { let m = toMatrix(a); if (boolArg(byCol, false)) m = F.TRANSPOSE(m); const ig = numArg(ignore, 0); return m.flat().filter((x) => !((ig === 1 || ig === 3) && x === null) && !((ig === 2 || ig === 3) && isErr(x))).map((x) => [x]); };
 F.TOROW = (a, ignore, byCol) => [F.TOCOL(a, ignore, byCol).map((r) => r[0])];
-F.WRAPROWS = (v, n, pad) => { const items = toMatrix(v).flat(); const w = Math.floor(numArg(n)); if (w < 1) return ERR['#NUM!']; const out = []; for (let i = 0; i < items.length; i += w) { const r = items.slice(i, i + w); while (r.length < w) r.push(pad === undefined ? ERR['#N/A'] : scalar(pad)); out.push(r); } return out; };
+F.WRAPROWS = (v, n, pad) => { const items = toMatrix(v).flat(); const w = Math.floor(numArg(n)); if (!(w >= 1)) return ERR['#NUM!']; arraySize(Math.ceil(items.length / w), w); const out = []; for (let i = 0; i < items.length; i += w) { const r = items.slice(i, i + w); while (r.length < w) r.push(pad === undefined ? ERR['#N/A'] : scalar(pad)); out.push(r); } return out; };
 F.WRAPCOLS = (v, n, pad) => F.TRANSPOSE(F.WRAPROWS(v, n, pad));
-F.EXPAND = (a, rows, cols, pad) => { const m = toMatrix(a); const h = numArg(rows, m.length), w = numArg(cols, m[0].length); const p = pad === undefined ? ERR['#N/A'] : scalar(pad); return Array.from({ length: h }, (_, i) => Array.from({ length: w }, (__, j) => (m[i] && j < m[i].length ? m[i][j] : p))); };
+F.EXPAND = (a, rows, cols, pad) => { const m = toMatrix(a); const h = numArg(rows, m.length), w = numArg(cols, m[0].length); arraySize(Math.floor(h), Math.floor(w)); const p = pad === undefined ? ERR['#N/A'] : scalar(pad); return Array.from({ length: h }, (_, i) => Array.from({ length: w }, (__, j) => (m[i] && j < m[i].length ? m[i][j] : p))); };
 
 // ---- information
 F.ISBLANK = L((a) => scalar(a) === null);
@@ -1869,8 +2442,10 @@ const ARRAY_FNS = new Set(['TRANSPOSE', 'UNIQUE', 'SORT', 'SORTBY', 'FILTER', 'S
   'DROP', 'CHOOSECOLS', 'CHOOSEROWS', 'TOCOL', 'TOROW', 'WRAPROWS', 'WRAPCOLS', 'EXPAND', 'TEXTSPLIT', 'MMULT', 'MINVERSE', 'MUNIT',
   'FREQUENCY', 'MODE.MULT', 'TREND', 'OFFSET', 'INDIRECT', 'INDEX', 'XLOOKUP', 'REGEXEXTRACT', 'ROW', 'COLUMN']);
 const REDUCERS = new Set(['SUM', 'SUMIF', 'SUMIFS', 'SUMPRODUCT', 'AVERAGE', 'AVERAGEIF', 'AVERAGEIFS', 'COUNT', 'COUNTA', 'COUNTIF',
-  'COUNTIFS', 'COUNTBLANK', 'MIN', 'MAX', 'MINIFS', 'MAXIFS', 'MEDIAN', 'PRODUCT', 'STDEV', 'VAR', 'VLOOKUP', 'HLOOKUP', 'MATCH',
+  'COUNTIFS', 'COUNTBLANK', 'MIN', 'MAX', 'MINIFS', 'MAXIFS', 'MEDIAN', 'PRODUCT', 'STDEV', 'VAR',
   'LOOKUP', 'CONCAT', 'TEXTJOIN', 'AND', 'OR', 'ROWS', 'COLUMNS', 'LARGE', 'SMALL', 'RANK', 'NPV', 'IRR', 'SUBTOTAL', 'AGGREGATE']);
+// they give an array for an array of lookup values (their first argument), one value otherwise
+const LOOKUP_FNS = new Set(['VLOOKUP', 'HLOOKUP', 'MATCH']);
 function mayArray(node) {
   if (!node) return false;
   switch (node.k) {
@@ -1881,10 +2456,81 @@ function mayArray(node) {
     case 'fn':
       if (ARRAY_FNS.has(node.name)) return true;
       if (REDUCERS.has(node.name)) return false;
+      if (LOOKUP_FNS.has(node.name)) return mayArray(node.args[0]);
       return node.args.some(mayArray);
     case 'bin': case 'span': return mayArray(node.a) || mayArray(node.b);
     case 'neg': case 'pct': return mayArray(node.a);
     default: return false;
+  }
+}
+/**
+ * Like mayArray, but stricter, for formulas kept as #CALC! (see Engine.noteSlowSpill): this-row table references and
+ * names of a single cell give one value, so a formula made of them does not spill.
+ */
+// functions that give one value whatever their arguments (spillsArray), and ones that give an array only for an array
+// of their later arguments (the k of PERCENTILE)
+const SCALAR_FNS = new Set(['MDETERM', 'STDEV.S', 'STDEV.P', 'STDEVA', 'STDEVP', 'STDEVPA', 'VAR.S', 'VAR.P', 'VARA', 'VARP',
+  'VARPA', 'CORREL', 'PEARSON', 'COVARIANCE.P', 'COVARIANCE.S', 'COVAR', 'SLOPE', 'INTERCEPT', 'RSQ', 'STEYX', 'GEOMEAN',
+  'HARMEAN', 'KURT', 'SKEW', 'SKEW.P', 'DEVSQ', 'AVEDEV', 'SUMSQ', 'SUMX2MY2', 'SUMX2PY2', 'SUMXMY2', 'XNPV', 'XIRR', 'MIRR',
+  'AVERAGEA', 'MAXA', 'MINA', 'MODE', 'MODE.SNGL']);
+const K_FNS = new Set(['PERCENTILE', 'PERCENTILE.INC', 'PERCENTILE.EXC', 'QUARTILE', 'QUARTILE.INC', 'QUARTILE.EXC',
+  'PERCENTRANK', 'PERCENTRANK.INC', 'PERCENTRANK.EXC']);
+function spillsArray(node, names, depth) {
+  if (!node) return false;
+  switch (node.k) {
+    case 'ref': return node.ref.kind !== 'cell' || !!node.ref.spill;
+    case 'sref': { const inner = String(node.spec || '').slice(1, -1).trim(); return !(inner[0] === '@' || /#this\s+row/i.test(inner)); }
+    case 'lit': return isMatrix(node.v);
+    case 'name': {
+      const up = String(node.v).toUpperCase();
+      const def = names[node.v] ?? Object.entries(names).find(([k]) => k.toUpperCase() === up)?.[1];
+      if (def === undefined || depth > 4) return true; // a table's name, or names of names of names
+      return spillsArray(parseFormula(String(def).replace(/^=/, '')), names, depth + 1);
+    }
+    case 'fn':
+      // ROW() and COLUMN() of one cell give one number
+      if (node.name === 'ROW' || node.name === 'COLUMN') return node.args.length > 0 && spillsArray(node.args[0], names, depth);
+      if (ARRAY_FNS.has(node.name)) return true;
+      if (REDUCERS.has(node.name) || SCALAR_FNS.has(node.name)) return false;
+      if (LOOKUP_FNS.has(node.name)) return spillsArray(node.args[0], names, depth);
+      if (K_FNS.has(node.name)) return node.args.slice(1).some((a) => spillsArray(a, names, depth));
+      return node.args.some((a) => spillsArray(a, names, depth));
+    case 'bin': case 'span': return spillsArray(node.a, names, depth) || spillsArray(node.b, names, depth);
+    case 'neg': case 'pct': return spillsArray(node.a, names, depth);
+    default: return false;
+  }
+}
+
+/**
+ * The formulas of a sheet that may spill (sorted by row, then column) that a recalculation has not evaluated yet. Each
+ * node of a tree over the list keeps the smallest column below it, so the first one above and left of a cell is found
+ * in log n steps, however many there are.
+ */
+const NO_COL = 0x7fffffff;
+class SpillScan {
+  constructor(cands) {
+    let size = 1;
+    while (size < cands.length) size *= 2;
+    const min = new Int32Array(2 * size).fill(NO_COL);
+    for (let i = 0; i < cands.length; i++) min[size + i] = cands[i][1];
+    for (let k = size - 1; k >= 1; k--) min[k] = Math.min(min[2 * k], min[2 * k + 1]);
+    this.cands = cands; this.size = size; this.min = min;
+  }
+  /** The first one in node k (list positions lo .. lo + span - 1) with row <= r and column <= c, or -1. */
+  first(k, lo, span, r, c) {
+    if (lo >= this.cands.length || this.min[k] > c || this.cands[lo][0] > r) return -1;
+    if (span === 1) return lo;
+    const half = span >> 1, i = this.first(2 * k, lo, half, r, c);
+    return i >= 0 ? i : this.first(2 * k + 1, lo + half, half, r, c);
+  }
+  /** Takes the first one with row <= r and column <= c (it is not returned again): its list position, or -1. */
+  take(r, c) {
+    const i = this.first(1, 0, this.size, r, c);
+    if (i < 0) return -1;
+    let k = this.size + i;
+    this.min[k] = NO_COL;
+    for (k >>= 1; k >= 1; k >>= 1) this.min[k] = Math.min(this.min[2 * k], this.min[2 * k + 1]);
+    return i;
   }
 }
 
@@ -1902,13 +2548,75 @@ export class Engine {
     this.invalidate();
   }
   invalidate() {
-    this.cache = new Map();
+    this.cache = new Map();    // "sid|r|c" → value; "@sid|r|c|formula" → value of a formula outside cells (evalAt)
     this.stack = new Set();
     this.spills = new Map();   // anchor "sid|r|c" → { rows, cols, m }
     this.cover = new Map();    // covered "sid|r|c" → anchor key
     this.links = new Map();    // "sid|r|c" → url (HYPERLINK)
     this.indexes = new Map();  // sheet id → { candidates }
+    this.names = new Map();    // "NAME|sid|r|c" → value of a defined name where it is used
+    this.scans = new Map();    // sheet id → { left: SpillScan, busy }: spill candidates not evaluated yet
+    this.filled = new Map();   // sheet id → Map(row id → Set of column ids that have a cell)
+    fixedFormulas.clear();     // defined names may have changed (see cellIndependent)
+    this.forgetHeavy();
+    refill();
   }
+  /** Resets what is known about formulas too heavy to compute (see stopped), with the computed values. */
+  forgetHeavy() {
+    this.done = 0;               // formulas and names computed (or found too heavy) so far
+    this.slowReads = 0;          // reads that gave the #CALC! of a formula too heavy to compute (see hit)
+    this.heavyGroups = new Set(); // groups of formulas outside cells found too heavy (a conditional formatting rule)
+    this.heavyNames = new Set(); // defined names found too heavy wherever they are used
+    this.slowSpills = new Map(); // sheet id → { keys, rows, big }: where formulas kept as #CALC! might spill (noteSlowSpill)
+    this.atCache = new Map();    // results of formulas outside cells (evalAt), and the generation before (see keep)
+    this.atOld = new Map();
+    this.atHeavy = new Set();    // keys of formulas outside cells found too heavy for their cell
+    this.groupProofs = new Map(); // group → cells of it found too heavy (see proofs)
+    this.nameProofs = new Map(); // name and sheet → the same for positions of a defined name
+    this.computed = new Set();   // groups, and names on a sheet, that were computed for some cell (see proofs)
+    this.fullAt = -1;            // the burst in which the kept results of evalAt reached KEEP_MAX / 2 (see keep)
+    this.usefulMs = this.usefulMs || 0; // time of evaluations that computed something (see waste), never reset
+    this.inner = null;           // the innermost evaluation that a stop of the budget went through (see stopped)
+    this.pending = null;         // the evaluation to start the next burst with (see settle)
+    // never reset, so that callers can tell whether a burst got further (see progress)
+    this.work = this.work || 0;
+    this.heavy = this.heavy || 0;
+    this.wastedMs = this.wastedMs || 0;
+  }
+  /** Time spent on evaluations that the work budget stopped before they computed anything (in ms, never reset): the
+   * widget limits it per change. */
+  wasted() { return this.wastedMs; }
+  /** Adds to wasted() the time of an evaluation that started at t0 and was just stopped: what it computed before
+   * (usefulMs since u0: the formulas it read and computed) is not lost. A stop by the clock on a page in the background
+   * is not counted: it proves nothing (see
+   * provenHeavy), and the evaluation is done again when the page is in front. */
+  waste(t0, u0) {
+    if (byClock && pageHidden()) return;
+    this.wastedMs += Math.max(0, clockNow() - t0 - (this.usefulMs - u0));
+  }
+  /** Counts one more cell of a group, or position of a name, found too heavy: true from the third on when none of its
+   * cells was computed since values were cleared, so that it is then too heavy everywhere (one burst for each of its
+   * cells could keep the page busy for a long time). One that was computed somewhere goes on cell by cell. */
+  proofs(map, k) {
+    if (this.computed.has(k)) return false;
+    const n = (map.get(k) || 0) + 1;
+    map.set(k, n);
+    return n >= 3;
+  }
+  /** Counts work done for the widget with values of this engine (statistics of a conditional formatting rule) as
+   * progress (see progress). */
+  noteProgress() { this.work++; }
+  /** Grows whenever something is computed or found too heavy to compute: a burst that leaves it as it was computed
+   * nothing new. */
+  progress() { return this.work; }
+  /** Grows whenever a formula, a defined name or a rule is found too heavy to compute (see stopped). */
+  heavyFound() { return this.heavy; }
+  /** Whether the value kept for a cell is the #CALC! of a formula too heavy to compute (or of one built from it), and
+   * not only a value that is not computed yet. */
+  keptSlow(sheet, r, c) { return this.cache.get(sheet.id + '|' + r + '|' + c) === SLOW; }
+  /** Counts a read of something that is not known because of a formula too heavy to compute, such as a row that a table
+   * filter cannot tell is hidden: the formula being evaluated becomes #CALC! (see tainted). */
+  slowRead() { this.slowReads++; }
   /** Forgets computed values but keeps the per-sheet indexes: for repeated recalculation when only constants
    * changed (Solver, Goal Seek, scenario summaries). */
   invalidateValues() {
@@ -1917,6 +2625,11 @@ export class Engine {
     this.spills = new Map();
     this.cover = new Map();
     this.links = new Map();
+    this.names = new Map();
+    this.scans = new Map();
+    this.filled = new Map();
+    this.forgetHeavy();
+    refill();
   }
   sheetByName(name) {
     const low = String(name).toLowerCase();
@@ -1925,8 +2638,22 @@ export class Engine {
   raw(sheet, r, c) {
     const rid = sheet.rows[r], cid = sheet.cols[c];
     if (rid === undefined || cid === undefined) return undefined;
+    // most cells of a big range are empty: find that out without building the "row:col" key
+    let filled = this.filled.get(sheet.id);
+    if (!filled) {
+      filled = new Map();
+      for (const k in sheet.cells) {
+        const i = k.indexOf(':'), row = k.slice(0, i);
+        if (!filled.has(row)) filled.set(row, new Set());
+        filled.get(row).add(k.slice(i + 1));
+      }
+      this.filled.set(sheet.id, filled);
+    }
+    const cols = filled.get(rid);
+    if (!cols || !cols.has(cid)) return undefined;
     const cell = sheet.cells[rid + ':' + cid];
-    return cell ? cell.v : undefined;
+    // stored values are text; anything else (damaged or foreign data) counts as an empty cell
+    return cell && typeof cell.v === 'string' ? cell.v : undefined;
   }
   index(sheet) {
     let ix = this.indexes.get(sheet.id);
@@ -1935,53 +2662,231 @@ export class Engine {
     const cols = new Map(sheet.cols.map((id, i) => [id, i]));
     const candidates = [];
     for (const k in sheet.cells) {
-      const v = sheet.cells[k].v;
+      const cell = sheet.cells[k], v = cell && cell.v;
       if (typeof v !== 'string' || v[0] !== '=') continue;
       if (!mayArray(parseFormula(v.slice(1)))) continue;
       const p = k.split(':');
       const r = rows.get(p[0]), c = cols.get(p[1]);
       if (r !== undefined && c !== undefined) candidates.push([r, c]);
     }
-    ix = { candidates };
+    candidates.sort((a, b) => a[0] - b[0] || a[1] - b[1]); // row by row, the order the grid is drawn in
+    // keys: to tell whether a cell kept as #CALC! is one of them (see noteSlowSpill)
+    ix = { candidates, keys: new Set(candidates.map((p) => sheet.id + '|' + p[0] + '|' + p[1])) };
     this.indexes.set(sheet.id, ix);
     return ix;
   }
   /** Computed value of a cell (number, string, boolean, null or FormulaError). */
   valueAt(sheet, r, c) {
     if (r < 0 || c < 0 || r >= sheet.rows.length || c >= sheet.cols.length) return null;
-    const key = sheet.id + '|' + r + '|' + c;
-    if (this.cache.has(key)) return this.cache.get(key);
+    // reads made by a formula count against the work budget
+    const top = this.stack.size === 0;
+    if (!top) tick(1);
+    else if (this.pending) this.settle();
     const raw = this.raw(sheet, r, c);
     let v;
     if (raw === undefined || raw === null || raw === '') {
-      // part of a spilled array?
-      let unsure = false;
-      for (const [ar, ac] of this.index(sheet).candidates) {
-        if (ar > r || ac > c) continue;
-        const ak = sheet.id + '|' + ar + '|' + ac;
-        if (this.stack.has(ak)) { unsure = true; continue; }
-        this.valueAt(sheet, ar, ac);
+      // part of a spilled array? (empty cells are not kept, so that reading a whole sheet does not fill the cache)
+      if (!this.index(sheet).candidates.length) return null;
+      const unsure = top && spent() ? false : this.scanSpills(sheet, r, c);
+      if (this.cover.size) {
+        const key = sheet.id + '|' + r + '|' + c;
+        if (this.cache.has(key)) return this.hit(this.cache.get(key));
+        const anchor = this.cover.get(key);
+        if (anchor) {
+          const sp = this.spills.get(anchor);
+          const [, ar, ac] = anchor.split('|').map(Number);
+          const row = sp && sp.m[r - ar];
+          if (row && c - ac < row.length) {
+            v = row[c - ac];
+            if (v === null || v === undefined) v = 0;
+            if (!unsure && !spent()) { this.cache.set(key, v); this.work++; }
+            return v;
+          }
+          this.cover.delete(key); // not covered any more
+        }
       }
-      const anchor = this.cover.get(key);
-      if (anchor) {
-        const sp = this.spills.get(anchor);
-        const [, ar, ac] = anchor.split('|').map(Number);
-        v = sp.m[r - ar][c - ac];
-        if (v === null || v === undefined) v = 0;
-      } else v = null;
-      if (unsure) return v;
-    } else if (raw[0] === '=' && raw.length > 1) {
+      // an empty cell that a formula too heavy to compute might spill over (see noteSlowSpill): whether it is covered
+      // is not known, so a formula that reads it is not computed either (see tainted). Drawn, the cell is empty.
+      if (!top && this.slowSpillOver(sheet, r, c)) this.slowReads++;
+      return null;
+    }
+    const key = sheet.id + '|' + r + '|' + c;
+    if (this.cache.has(key)) return this.hit(this.cache.get(key));
+    if (raw[0] === '=' && raw.length > 1) {
+      // once the budget is spent, a formula that is not computed yet gives #CALC! (not kept, so it is computed when
+      // there is budget again); typed values are read as usual
+      if (top && spent()) return SLOW;
       if (this.stack.has(key)) return ERR['#CIRC!'];
+      const whole = wholeBudget(), done = this.done, reads = this.slowReads, t0 = clockNow(), u0 = this.usefulMs;
+      if (top) this.inner = null;
       this.stack.add(key);
       try { v = this.evalCell(raw.slice(1), sheet, r, c, key); } finally { this.stack.delete(key); }
+      if (spent() || this.slowReads !== reads) {
+        // stopped by the budget, or built from a formula too heavy to compute: the result may be partial or wrong, so
+        // nothing of it is kept, not even the array it spilled
+        this.dropSpill(sheet, r, c, key);
+        this.links.delete(key);
+        if (!spent()) { this.usefulMs = u0 + (clockNow() - t0); return this.tainted(key, sheet, r, c); }
+        // the innermost evaluation that the stop went through is the first to get here
+        if (!this.inner) this.inner = { key, sheet, r, c };
+        if (top) this.waste(t0, u0);
+        return this.stopped(key, whole, done, top, sheet, r, c);
+      }
+      this.done++;
+      // its time is useful (it replaces the time of the formulas it read, which is part of it)
+      this.usefulMs = u0 + (clockNow() - t0);
     } else v = literal(raw);
     this.cache.set(key, v);
+    this.work++;
     return v;
   }
+  /** A kept value. Reading the #CALC! of a formula too heavy to compute (see stopped) is counted, so that what is built
+   * from it is #CALC! as well (see tainted). */
+  hit(v) {
+    if (v === SLOW) this.slowReads++;
+    return v;
+  }
+  /**
+   * Whether an evaluation that the work budget stopped is too heavy to compute in any burst: it started with the whole
+   * budget (see wholeBudget) and computed nothing on the way. The clock does not prove it on a page in the background,
+   * which runs slower (the widget draws again when the page is in front). Counted as found.
+   */
+  provenHeavy(whole, done) {
+    if (this.done !== done || !whole || (byClock && pageHidden())) return false;
+    this.done++;
+    this.work++;
+    this.heavy++;
+    return true;
+  }
+  /**
+   * After an evaluation of a cell that the work budget stopped: gives #CALC! (SLOW).
+   * - The stop may have come from a formula or name that it reads (this.inner, the innermost evaluation the stop went
+   *   through). When that one is not proven too heavy (it did not start with the whole budget, because this one read a
+   *   lot first), it starts the next burst (see settle), and this one is not kept as heavy: otherwise every formula
+   *   that reads a heavy one would be found heavy on its own, one burst each.
+   * - One proven too heavy keeps SLOW until values are cleared, so that later bursts get to the formulas after it.
+   * - A cell of the drawing (top) that is not proven (it did not start with the whole budget) starts the next burst.
+   */
+  stopped(key, whole, done, top, sheet, r, c) {
+    const inner = this.inner;
+    if (inner && inner.key !== key && !inner.proven) {
+      if (top) { if (!inner.at) this.pending = inner; this.inner = null; }
+      return SLOW;
+    }
+    const proven = this.provenHeavy(whole, done);
+    if (proven) { this.cache.set(key, SLOW); this.noteSlowSpill(sheet, r, c, key); }
+    if (inner && inner.key === key) inner.proven = proven;
+    if (top) {
+      if (!proven && (!inner || inner.key === key)) this.pending = { key, sheet, r, c };
+      this.inner = null;
+    }
+    return SLOW;
+  }
+  /** Starts a burst with the evaluation that stopped a formula reading it in an earlier burst (see stopped), when the
+   * whole budget is left: it is then computed, or proven too heavy, once. */
+  settle() {
+    if (!wholeBudget()) return;
+    const p = this.pending;
+    this.pending = null;
+    if (p.name) {
+      const t0 = clockNow(), u0 = this.usefulMs;
+      try { this.resolveName(p.name, { sheet: p.sheet, r: p.r, c: p.c, cell: false }); } catch (e) { if (e !== SLOW) throw e; }
+      if (spent()) this.waste(t0, u0);
+      this.inner = null;
+    } else if (!this.cache.has(p.key) && p.r < p.sheet.rows.length && p.c < p.sheet.cols.length) this.valueAt(p.sheet, p.r, p.c);
+  }
+  /**
+   * Notes a formula kept as #CALC! that may give an array (see index and spillsArray): whether it covers the empty cells
+   * right of it and below it is not known (see valueAt). Only cells it could cover count: up to the first cell with a
+   * value below it and right of it (an array that would cover a value gives #SPILL! instead).
+   */
+  noteSlowSpill(sheet, r, c, key) {
+    if (!sheet || !this.index(sheet).keys.has(key)) return;
+    let s = this.slowSpills.get(sheet.id);
+    if (!s) { s = { keys: new Set(), rows: new Map(), big: [] }; this.slowSpills.set(sheet.id, s); }
+    if (s.keys.has(key)) return;
+    s.keys.add(key);
+    const raw = this.raw(sheet, r, c);
+    if (typeof raw !== 'string' || raw[0] !== '=' || !spillsArray(parseFormula(raw.slice(1)), this.book.names || {}, 0)) return;
+    const empty = (rr, cc) => { const x = this.raw(sheet, rr, cc); return x === undefined || x === ''; };
+    let r2 = r + 1, c2 = c + 1;
+    while (r2 < sheet.rows.length && r2 - r <= 4096 && empty(r2, c)) r2++;
+    while (c2 < sheet.cols.length && empty(r, c2)) c2++;
+    if (r2 - r > 4096) r2 = sheet.rows.length; // looked at far enough: to the end of the sheet
+    // small areas by row (a read looks at its own row only), big ones in a list
+    if ((r2 - r) * (c2 - c) <= 4096) {
+      for (let i = r; i < r2; i++) { let l = s.rows.get(i); if (!l) s.rows.set(i, (l = [])); l.push(c, c2); }
+    } else s.big.push(r, r2, c, c2);
+  }
+  /** Whether a formula kept as #CALC! might spill over (r, c) of the sheet (see noteSlowSpill). */
+  slowSpillOver(sheet, r, c) {
+    const s = this.slowSpills.get(sheet.id);
+    if (!s) return false;
+    const l = s.rows.get(r);
+    if (l) for (let i = 0; i < l.length; i += 2) if (c >= l[i] && c < l[i + 1]) return true;
+    const b = s.big;
+    for (let i = 0; i < b.length; i += 4) if (r >= b[i] && r < b[i + 1] && c >= b[i + 2] && c < b[i + 3]) return true;
+    return false;
+  }
+  /**
+   * The #CALC! of an evaluation that read the #CALC! of a formula too heavy to compute, kept like that one: the value
+   * read is not known, so neither is what is built from it (IFERROR, ISERROR or COUNT would otherwise turn it into a
+   * real value, which commands would then sort, total or export).
+   */
+  tainted(key, sheet, r, c) {
+    this.cache.set(key, SLOW);
+    this.done++;
+    this.work++;
+    this.noteSlowSpill(sheet, r, c, key);
+    return SLOW;
+  }
+  /** Forgets the array spilled from a cell and the cells it covers. */
+  dropSpill(sheet, r, c, key) {
+    const sp = this.spills.get(key);
+    if (!sp) return;
+    this.spills.delete(key);
+    for (let i = 0; i < sp.rows; i++) {
+      for (let j = 0; j < sp.cols; j++) {
+        const ck = sheet.id + '|' + (r + i) + '|' + (c + j);
+        if ((i || j) && this.cover.get(ck) === key) { this.cover.delete(ck); this.cache.delete(ck); }
+      }
+    }
+  }
+  /**
+   * Evaluates the formulas that may spill over (r, c), the ones above and left of it (each once per recalculation),
+   * so that an empty cell knows whether an array covers it. Formulas right of the cell or below it cannot cover it and
+   * are not evaluated here: one that uses the formula being computed would get a false #CIRC!. True when one that is
+   * still being evaluated could cover (r, c).
+   */
+  scanSpills(sheet, r, c) {
+    const cands = this.index(sheet).candidates, at = (p) => sheet.id + '|' + p[0] + '|' + p[1];
+    let st = this.scans.get(sheet.id);
+    if (!st) { st = { left: new SpillScan(cands), busy: [] }; this.scans.set(sheet.id, st); }
+    // the formulas evaluated here are not read by the one that reads (r, c): one too heavy to compute does not make
+    // that one #CALC! (see hit). Like any error, its #CALC! does not spill, so (r, c) is empty as far as it goes.
+    const reads = this.slowReads;
+    try {
+      for (let i; !spent() && (i = st.left.take(r, c)) >= 0;) {
+        const p = cands[i];
+        st.busy.push(p);
+        if (!this.stack.has(at(p))) this.valueAt(sheet, p[0], p[1]);
+      }
+    } finally {
+      this.slowReads = reads;
+      if (spent()) this.scans.delete(sheet.id); // cut short by the work budget: scan again next time
+    }
+    if (!st.busy.length) return false;
+    st.busy = st.busy.filter((p) => this.stack.has(at(p)));
+    return st.busy.some((p) => p[0] <= r && p[1] <= c);
+  }
   evalCell(text, sheet, r, c, key) {
-    let v = this.evalFormula(text, { sheet, r, c });
+    const v = this.evalFormula(text, { sheet, r, c, cell: true });
     if (v instanceof Range || isMatrix(v)) {
-      const m = toMatrix(v);
+      // a range that cannot spill is not read cell by cell first
+      if (v instanceof Range && (v.rows > 1 || v.cols > 1) && (r + v.rows > sheet.rows.length || c + v.cols > sheet.cols.length)) return ERR['#SPILL!'];
+      let m;
+      try { m = toMatrix(v); } catch (e) { return isErr(e) ? e : ERR['#VALUE!']; }
+      if (!m.length || !m[0]) return ERR['#CALC!']; // an empty array
       if (m.length === 1 && m[0].length === 1) return fix(m[0][0]);
       // spill into the cells below and to the right
       if (r + m.length > sheet.rows.length || c + m[0].length > sheet.cols.length) return ERR['#SPILL!'];
@@ -2018,21 +2923,88 @@ export class Engine {
     const node = parseFormula(text);
     if (node.k === 'bad') return ERR['#ERROR!'];
     let v;
-    try { v = this.ev(node, ctx); } catch (e) {
+    try {
+      v = this.ev(node, ctx);
+      if (v instanceof Range) { if (v.rows === 1 && v.cols === 1) v = v.get(0, 0); else return v; }
+    } catch (e) {
       if (isErr(e)) return e;
       console.warn('Formula failed', text, e);
       return ERR['#VALUE!'];
     }
-    if (v instanceof Range) { if (v.rows === 1 && v.cols === 1) v = v.get(0, 0); else return v; }
     if (isMatrix(v)) return v;
     if (typeof v === 'number' && !isFinite(v)) return ERR['#NUM!'];
     if (v === null || v === undefined) return 0; // =A1 with an empty A1 shows 0, like Excel
+    if (longText(v)) return ERR['#VALUE!']; // longer than a cell can hold
     return v;
   }
-  /** Evaluates a formula typed somewhere other than a cell (conditional formatting, validation). */
-  evalAt(formula, sheet, r, c) {
-    const v = this.evalFormula(String(formula).replace(/^=/, ''), { sheet, r, c });
-    return scalar(v);
+  /**
+   * Evaluates a formula typed somewhere other than a cell (conditional formatting, validation). group names what the
+   * formula belongs to, for all the cells it is evaluated for (a conditional formatting rule): its results are kept
+   * until values are cleared (at most KEEP_MAX), so that drawing again does not compute them again and a redraw gets
+   * further than the one before; and once it is too heavy for one cell, it is #CALC! for all of them, instead of
+   * costing a whole burst for each. Without a group only a formula too heavy is kept (as #CALC!, see stopped). Keys are
+   * ones that no cell has: cell keys start with a sheet id.
+   */
+  evalAt(formula, sheet, r, c, group, shared) {
+    const key = '@' + sheet.id + '|' + r + '|' + c + '|' + (group || formula);
+    // a result computed before stays, also once its group is found too heavy elsewhere
+    const kept = this.keptValue(key);
+    if (kept !== undefined) return kept;
+    if (group && this.heavyGroups.has(group)) { this.slowReads++; return SLOW; }
+    if (this.pending && this.stack.size === 0) this.settle();
+    if (spent()) return SLOW;
+    const whole = wholeBudget(), done = this.done, reads = this.slowReads, t0 = clockNow(), u0 = this.usefulMs;
+    this.inner = null;
+    // on the stack while it is evaluated: the cells it reads are then reads of a formula, which count against the work
+    // budget (see valueAt), so that a formula outside cells is stopped like one in a cell
+    this.stack.add(key);
+    let v;
+    try { v = scalar(this.evalFormula(String(formula).replace(/^=/, ''), { sheet, r, c })); } finally { this.stack.delete(key); }
+    if (spent()) {
+      const inner = this.inner || { key };
+      this.inner = null;
+      this.waste(t0, u0);
+      // stopped in a formula or name that it reads, not proven too heavy: that one starts the next burst (see stopped)
+      if (inner.key !== key && !inner.proven) { if (!inner.at) this.pending = inner; return SLOW; }
+      // too heavy: for every cell when the formula is the same everywhere (shared), or once it was too heavy in a few
+      // cells in a row (see proofs); else for this cell
+      if (inner.key === key && this.provenHeavy(whole, done)) {
+        if (group && (shared || this.proofs(this.groupProofs, group))) this.heavyGroups.add(group);
+        else this.atHeavy.add(key);
+      }
+      return SLOW;
+    }
+    this.usefulMs = u0 + (clockNow() - t0);
+    if (group) this.computed.add(group);
+    if (this.slowReads !== reads) { this.keep(key, SLOW); this.done++; this.work++; return SLOW; } // see tainted
+    if (group) { this.keep(key, v); this.done++; this.work++; }
+    return v;
+  }
+  /** The kept result of evalAt for a key (a read of it, see hit), or undefined. */
+  keptValue(key) {
+    if (this.atHeavy.has(key)) { this.slowReads++; return SLOW; }
+    if (this.atCache.has(key)) return this.hit(this.atCache.get(key));
+    if (this.atOld.has(key)) { const v = this.atOld.get(key); this.keep(key, v); return this.hit(v); }
+    return undefined;
+  }
+  /** Keeps a result of evalAt. Results go to a new generation when the current one holds KEEP_MAX / 2, and the
+   * generation before is then dropped (its results are computed again when they are asked for), so that drawing a big
+   * sheet with many rules cannot fill the memory while the results of the last drawings stay. */
+  keep(key, v) {
+    if (this.atCache.size >= KEEP_MAX / 2) {
+      // a new generation, but not in the middle of a burst: the results of the drawing in progress stay
+      if (this.fullAt < 0) this.fullAt = burstNo;
+      else if (this.fullAt !== burstNo) { this.atOld = this.atCache; this.atCache = new Map(); this.fullAt = -1; }
+    }
+    this.atCache.set(key, v);
+  }
+  /** The kept result of a group's formula for a cell (see evalAt), or undefined: the caller then builds the formula for
+   * the cell (a conditional formatting rule's formula, translated for each cell) and evaluates it. */
+  keptAt(sheet, r, c, group) {
+    const v = this.keptValue('@' + sheet.id + '|' + r + '|' + c + '|' + group);
+    if (v !== undefined) return v;
+    if (this.heavyGroups.has(group)) { this.slowReads++; return SLOW; }
+    return undefined;
   }
   rangeFor(ref, ctx) {
     const sheet = ref.sheet != null ? this.sheetByName(ref.sheet) : ctx.sheet;
@@ -2051,6 +3023,10 @@ export class Engine {
     if (ref.kind === 'rows') { c1 = 0; c2 = sheet.cols.length - 1; }
     if (r1 > r2) [r1, r2] = [r2, r1];
     if (c1 > c2) [c1, c2] = [c2, c1];
+    return this.clip(sheet, r1, c1, r2, c2);
+  }
+  /** A range cut to the rows and columns the sheet has (but at least one cell). */
+  clip(sheet, r1, c1, r2, c2) {
     return new Range(this, sheet, r1, c1, Math.min(r2, Math.max(r1, sheet.rows.length - 1)), Math.min(c2, Math.max(c1, sheet.cols.length - 1)));
   }
   resolveName(name, ctx) {
@@ -2058,13 +3034,49 @@ export class Engine {
     const names = this.book.names || {};
     const def = names[name] ?? Object.entries(names).find(([k]) => k.toUpperCase() === name)?.[1];
     if (def !== undefined) {
+      // a name is evaluated once for each cell that uses it (it may depend on that cell, as in ROW() or [@Col]);
+      // evaluating it again for every reference made names that use names cost exponential time
+      const at = name + '|' + (ctx.sheet ? ctx.sheet.id : '') + '|' + ctx.r + '|' + ctx.c;
+      if (this.names.has(at)) return this.hit(this.names.get(at));
+      // a name too heavy to compute is #CALC! wherever it is used on the sheet (references without a sheet and SHEET()
+      // are the using cell's): finding that out costs a whole burst, once
+      const onSheet = name + '|' + (ctx.sheet ? ctx.sheet.id : '');
+      if (this.heavyNames.has(onSheet)) { this.slowReads++; return SLOW; }
       const key = 'name|' + name;
       if (this.stack.has(key)) return ERR['#CIRC!'];
+      const whole = wholeBudget(), done = this.done, reads = this.slowReads, t0 = clockNow(), u0 = this.usefulMs;
       this.stack.add(key);
+      let v, thrown = false;
       try {
         const node = parseFormula(String(def).replace(/^=/, ''));
-        return node.k === 'bad' ? ERR['#NAME?'] : this.ev(node, { ...ctx, vars: null });
+        // cell: false, so that a HYPERLINK in a name does not set the link of the cells that use it
+        v = node.k === 'bad' ? ERR['#NAME?'] : this.ev(node, { ...ctx, vars: null, cell: false });
+      } catch (e) {
+        // the work budget's stop is thrown through the name: it is noted here, then goes on up as before
+        if (e !== SLOW || !spent()) throw e;
+        thrown = true;
       } finally { this.stack.delete(key); }
+      if (spent()) { // stopped by the work budget: the value may be partial
+        const nk = key + '|' + at;
+        if (!this.inner) this.inner = { key: nk, name, sheet: ctx.sheet, r: ctx.r, c: ctx.c };
+        if (this.inner.key === nk) {
+          // too heavy: wherever it is used when it gives the same everywhere, else where it was used
+          const proven = this.inner.proven = this.provenHeavy(whole, done);
+          if (proven) {
+            if (cellIndependent(def, this.book.names) || this.proofs(this.nameProofs, onSheet)) this.heavyNames.add(onSheet);
+            else this.names.set(at, SLOW);
+          }
+        }
+        if (thrown) throw SLOW;
+        return SLOW;
+      }
+      if (this.slowReads !== reads) v = SLOW; // built from a formula too heavy to compute (see tainted)
+      this.names.set(at, v);
+      this.computed.add(onSheet);
+      this.usefulMs = u0 + (clockNow() - t0);
+      this.done++;
+      this.work++;
+      return v;
     }
     const table = this.book.findTable ? this.book.findTable(name) : null;
     if (table) return this.tableRange(table, '#Data');
@@ -2119,6 +3131,7 @@ export class Engine {
     return this.tableRange(t, part, cols[0], cols[1], thisRow);
   }
   ev(node, ctx) {
+    tick(1);
     switch (node.k) {
       case 'lit': return node.v;
       case 'empty': return null;
@@ -2130,7 +3143,7 @@ export class Engine {
       case 'span': {
         const a = this.ev(node.a, ctx), b = this.ev(node.b, ctx);
         if (!(a instanceof Range) || !(b instanceof Range) || a.sheet !== b.sheet) return ERR['#REF!'];
-        return new Range(this, a.sheet, Math.min(a.r1, b.r1), Math.min(a.c1, b.c1), Math.max(a.r2, b.r2), Math.max(a.c2, b.c2));
+        return this.clip(a.sheet, Math.min(a.r1, b.r1), Math.min(a.c1, b.c1), Math.max(a.r2, b.r2), Math.max(a.c2, b.c2));
       }
       case 'bin': return this.binary(node, ctx);
       case 'fn': {
@@ -2144,7 +3157,8 @@ export class Engine {
           if (!RAW.has(node.name) && isErr(v)) return v;
           args.push(v);
         }
-        return fn(...args);
+        const out = fn(...args);
+        return longText(out) ? ERR['#VALUE!'] : out; // text longer than a cell can hold
       }
       default: return ERR['#ERROR!'];
     }
@@ -2165,7 +3179,12 @@ function op(o, a, b) {
   if (isErr(a)) return a;
   if (isErr(b)) return b;
   switch (o) {
-    case '&': { const x = toStr(a), y = toStr(b); return isErr(x) ? x : isErr(y) ? y : x + y; }
+    case '&': {
+      const x = toStr(a), y = toStr(b);
+      if (isErr(x)) return x;
+      if (isErr(y)) return y;
+      return x.length + y.length > MAX_TEXT ? ERR['#VALUE!'] : x + y; // not longer than a cell can hold
+    }
     case '=': return compare(a, b) === 0;
     case '<>': return compare(a, b) !== 0;
     case '<': return compare(a, b) < 0;
@@ -2189,8 +3208,9 @@ function op(o, a, b) {
 
 /** Stored (non-formula) value → typed value. Stored numbers are canonical ("1234.5"). */
 export function literal(raw) {
+  if (typeof raw !== 'string') return null;
   if (raw[0] === "'") return raw.slice(1);
-  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) return parseFloat(raw);
+  if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) return parseFloat(raw);
   const up = raw.toUpperCase();
   if (up === 'TRUE') return true;
   if (up === 'FALSE') return false;
@@ -2218,7 +3238,10 @@ export function localeInfo(locale) {
   return info;
 }
 
-const CURRENCY_RE = /^([₺$€£¥₽₹]|TL|USD|EUR|TRY|GBP)?\s*([-+]?[\d.,\s ']+)\s*([₺$€£¥₽₹]|TL|USD|EUR|TRY|GBP)?$/i;
+// The number part starts and ends with a digit or separator, so that a run of spaces can be read in one way only
+// (overlapping \s* around [\d\s]+ made these patterns take cubic time on long runs of spaces).
+const CURRENCY_RE = /^([₺$€£¥₽₹]|TL|USD|EUR|TRY|GBP)?\s*((?:[-+]\s*)?[\d.,'](?:[\d.,\s']*[\d.,'])?)\s*([₺$€£¥₽₹]|TL|USD|EUR|TRY|GBP)?$/i;
+const PERCENT_RE = /^%?\s*((?:[-+]\s*)?[\d.,](?:[\d.,\s]*[\d.,])?)\s*%$|^%\s*((?:[-+]\s*)?[\d.,](?:[\d.,\s]*[\d.,])?)$/;
 
 function parseLocaleNumber(s, info) {
   let t = s.replace(/[\s ']/g, '');
@@ -2260,9 +3283,10 @@ export function parseInput(text, locale) {
   if (s[0] === '=' && s.length > 1) return { kind: 'formula', raw: s };
   if (s[0] === '+' && s.length > 1 && /[A-Za-z(]/.test(s)) return { kind: 'formula', raw: '=' + s.slice(1) };
   if (s[0] === "'") return { kind: 'text', raw: s };
+  if (t.length > 1000) return { kind: 'text', raw: s }; // far too long for a number or a date
   const up = t.toUpperCase();
   if (up === 'TRUE' || up === 'FALSE' || up === 'DOĞRU' || up === 'YANLIŞ') return { kind: 'bool', raw: up === 'TRUE' || up === 'DOĞRU' ? 'TRUE' : 'FALSE' };
-  let m = /^%?\s*([-+]?[\d.,\s]+)\s*%$|^%\s*([-+]?[\d.,\s]+)$/.exec(t);
+  let m = PERCENT_RE.exec(t);
   if (m) {
     const numPart = m[1] || m[2];
     const n = parseLocaleNumber(numPart, info);
@@ -2354,7 +3378,12 @@ export function formatValue(v, st, locale) {
   if (isErr(v)) return v.code;
   if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
   if (typeof v === 'string') return v;
-  if (isMatrix(v)) return formatValue(v[0][0], st, locale);
+  if (isMatrix(v)) return formatValue(v[0] && v[0][0], st, locale);
+  if (typeof v !== 'number') return '';
+  // a damaged style (out-of-range decimals, a pattern no formatter accepts) shows the plain number, never throws
+  try { return formatNumber(v, st, locale); } catch (e) { return numToText(v); }
+}
+function formatNumber(v, st, locale) {
   const nf = (st && st.nf) || 'gen';
   const dp = st && st.dp !== undefined ? st.dp : null;
   switch (nf) {
@@ -2370,7 +3399,14 @@ export function formatValue(v, st, locale) {
       return (v < 0 ? '(' + txt + ')' : txt);
     }
     case 'pct': return numberFormatter(locale, { style: 'percent', minimumFractionDigits: dp ?? 0, maximumFractionDigits: dp ?? 0 }).format(v);
-    case 'sci': return v.toExponential(dp ?? 2).toUpperCase().replace('.', localeInfo(locale).dec);
+    case 'sci': {
+      // past 15 significant digits toExponential shows the binary error (9.95 → 9.949999999999999E+0): zeros instead,
+      // as other spreadsheet apps show them
+      const d = dp ?? 2;
+      let t = v.toExponential(Math.min(d, 14));
+      if (d > 14) t = t.replace('e', '0'.repeat(d - 14) + 'e');
+      return t.toUpperCase().replace('.', localeInfo(locale).dec);
+    }
     case 'date': return formatSerialDate(v, locale, false);
     case 'ldate': return formatSerialDate(v, locale, false, true);
     case 'dt': return formatSerialDate(v, locale, true);
@@ -2454,7 +3490,7 @@ export function helpToLocal(text, style) {
 }
 
 export function editText(raw, st, locale) {
-  if (raw === undefined || raw === null) return '';
+  if (typeof raw !== 'string') return '';
   if (raw[0] === '=' || raw[0] === "'") return raw;
   const v = literal(raw);
   if (typeof v !== 'number') return raw;

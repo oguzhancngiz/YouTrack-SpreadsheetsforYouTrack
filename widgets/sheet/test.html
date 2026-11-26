@@ -23,7 +23,7 @@
 <pre id="out"></pre>
 <script src="sheet-core.js"></script>
 <script type="module">
-import { Engine, parseInput, formatValue, translateFormula, shiftFormula, renameSheetInFormula, isErr, formatWithPattern, formulaToLocal, formulaFromLocal, separatorStyle, helpToLocal } from './formula.js';
+import { Engine, parseInput, formatValue, translateFormula, shiftFormula, renameSheetInFormula, isErr, formatWithPattern, formulaToLocal, formulaFromLocal, separatorStyle, helpToLocal, literal, tokenize, editText, parseAddr, isSlowCalc, budgetSpent, colName } from './formula.js';
 import * as M from './model.js';
 const Core = window.SheetCore;
 
@@ -179,6 +179,10 @@ t('input parsing', () => {
   fv(1234.5, { nf: 'num', dp: 2 }, 'tr-TR', '1.234,50'); fv(0.125, { nf: 'pct', dp: 1 }, 'en-US', '12.5%'); fv(46343, { nf: 'date' }, 'tr-TR', '17.11.2026');
   fv(1250, { nf: 'cur', cur: '₺', dp: 2 }, 'tr-TR', '1.250,00 ₺'); fv(1/3, null, 'en-US', '0.3333333333');
   fv(12345678901, null, 'en-US', '12345678901'); fv(98765432109, null, 'en-US', '98765432109'); fv(123456789012, null, 'en-US', '1.23457E+11'); fv(-42, null, 'en-US', '-42');
+  // scientific with up to 15 decimals (the decimal buttons and Format cells reach 15): no binary noise in the last digits
+  fv(9.95, { nf: 'sci', dp: 15 }, 'en-US', '9.950000000000000E+0'); fv(-0.07, { nf: 'sci', dp: 15 }, 'tr-TR', '-7,000000000000000E-2');
+  fv(9.95, { nf: 'sci', dp: 14 }, 'en-US', '9.95000000000000E+0'); fv(1234.5, { nf: 'sci', dp: 2 }, 'en-US', '1.23E+3'); fv(0, { nf: 'sci', dp: 15 }, 'en-US', '0.000000000000000E+0');
+  fv(9.95, { nf: 'num', dp: 15 }, 'en-US', '9.950000000000000');
   results.push({ ok: formatWithPattern(-1234, '#,##0;[Red]-#,##0', 'en-US') === '-1,234', f: 'pattern negative section', v: formatWithPattern(-1234, '#,##0;[Red]-#,##0', 'en-US'), expected: '-1,234' });
 });
 t('formula separators', () => {
@@ -217,6 +221,54 @@ t('fill series', () => {
   const chk = (got, exp, label) => results.push({ ok: got === exp, f: label, v: got, expected: exp });
   chk(v(2, 0), '5', 'series 1,3 → 5'); chk(v(3, 0), '7', 'series → 7'); chk(v(2, 1), 'Wed', 'Mon → Wed'); chk(v(1, 2), 'Item 10', 'Item 9 → Item 10'); chk(v(2, 3), '=A3*2', 'formula fill');
 });
+// ---------------------------------------------------------------- several selected ranges (Ctrl+click), 1.2.7
+t('several ranges: copy, paste, cut, format', () => {
+  const chk = (got, exp, label) => results.push({ ok: JSON.stringify(got) === JSON.stringify(exp), f: 'ranges: ' + label, v: JSON.stringify(got), expected: JSON.stringify(exp) });
+  // which cells a copy of several ranges takes (as in Excel)
+  chk(M.copyLines([{ r1: 0, c1: 0, r2: 2, c2: 0 }, { r1: 0, c1: 3, r2: 2, c2: 4 }]), { rows: [0, 1, 2], cols: [0, 3, 4] }, 'columns over the same rows copy side by side');
+  chk(M.copyLines([{ r1: 5, c1: 1, r2: 5, c2: 2 }, { r1: 1, c1: 1, r2: 2, c2: 2 }]), { rows: [1, 2, 5], cols: [1, 2] }, 'rows over the same columns copy in sheet order');
+  chk(M.copyLines([{ r1: 0, c1: 0, r2: 2, c2: 0 }, { r1: 1, c1: 0, r2: 3, c2: 0 }]), { rows: [0, 1, 2, 3], cols: [0] }, 'overlapping ranges: each cell once');
+  chk(M.copyLines([{ r1: 0, c1: 0, r2: 2, c2: 0 }, { r1: 0, c1: 2, r2: 1, c2: 2 }]), null, 'neither the same rows nor the same columns: not copied');
+  // columns A and C copied together and pasted at E1 become E:F; a formula moves by the distance from its own cell
+  const sh = Core.newSheet('Multi', 10, 10);
+  const set = (r, c, v) => { sh.cells[sh.rows[r] + ':' + sh.cols[c]] = { v }; };
+  set(0, 0, '1'); set(1, 0, '2'); set(2, 0, '3'); set(0, 1, '10'); set(1, 1, '20'); set(2, 1, '30');
+  set(0, 2, '=B1*2'); set(1, 2, '=B2*2'); set(2, 2, '=B3*2');
+  const eng = new Engine({ sheets: [sh], names: {} }, 'en-US');
+  const docM = { sheets: [sh], names: {} };
+  const res = M.copyCells(eng, sh, [0, 1], [0, 2], 'en-US', false);
+  chk(res.text, '1\t20\r\n2\t40', 'copy of A1:A2 and C1:C2: text for other apps');
+  const ops = M.pasteOps(eng, docM, sh, { r1: 0, c1: 4, r2: 0, c2: 4 }, res.clip, { mode: 'all', locale: 'en-US' });
+  const at = (list, r, c) => (list.find((o) => o.k === sh.rows[r] + ':' + sh.cols[c]) || {}).v;
+  chk([at(ops, 0, 4), at(ops, 1, 4), at(ops, 0, 5), at(ops, 1, 5)], ['1', '2', '=E1*2', '=E2*2'], 'pasted at E1: formulas move by their own distance');
+  const vals = M.pasteOps(eng, docM, sh, { r1: 0, c1: 4, r2: 0, c2: 4 }, res.clip, { mode: 'values', locale: 'en-US' });
+  chk([at(vals, 0, 5), at(vals, 1, 5)], ['20', '40'], 'Values only reads the copied cells (column C)');
+  const tr = M.pasteOps(eng, docM, sh, { r1: 5, c1: 4, r2: 5, c2: 4 }, res.clip, { mode: 'all', transpose: true, locale: 'en-US' });
+  chk([at(tr, 5, 4), at(tr, 5, 5), at(tr, 6, 4), at(tr, 6, 5)], ['1', '2', '=D7*2', '=E7*2'], 'Transposed: each formula moves from its own cell');
+  // a copy that leaves a hidden row out: formulas, values and a cut follow the copied cells
+  sh.hr = { [sh.rows[1]]: 1 };
+  const cut = M.copyRect(eng, sh, { r1: 0, c1: 2, r2: 2, c2: 2 }, 'en-US', true);
+  const p2 = M.pasteOps(eng, docM, sh, { r1: 0, c1: 7, r2: 0, c2: 7 }, cut.clip, { mode: 'all', locale: 'en-US' });
+  chk([at(p2, 0, 7), at(p2, 1, 7)], ['=G1*2', '=G2*2'], 'copy without a hidden row: formulas move from their own rows');
+  const cleared = M.cutClearOps(docM, cut.clip, sh.id, { r1: 0, c1: 7, r2: 0, c2: 7 }).map((o) => o.k).sort();
+  chk(cleared, [sh.rows[0] + ':' + sh.cols[2], sh.rows[2] + ':' + sh.cols[2]].sort(), 'cut without a hidden row: the copied cells are cleared, the hidden one stays');
+  sh.hr = {};
+  // formats on several ranges: one change, only their cells; overlapping outside borders keep both outlines
+  const so = M.styleOpsMulti(sh, [{ r1: 0, c1: 0, r2: 0, c2: 0 }, { r1: 0, c1: 3, r2: 1, c2: 3 }], () => ({ b: 1 }));
+  chk(so.map((o) => o.k).sort(), [sh.rows[0] + ':' + sh.cols[0], sh.rows[0] + ':' + sh.cols[3], sh.rows[1] + ':' + sh.cols[3]].sort(), 'bold on two ranges: their cells only');
+  const bo = M.styleOpsMulti(sh, [{ r1: 0, c1: 0, r2: 1, c2: 1 }, { r1: 1, c1: 1, r2: 2, c2: 2 }], (rect) => M.borderPatch(rect, 'outer', null));
+  const bd = (r, c) => ((bo.find((o) => o.k === sh.rows[r] + ':' + sh.cols[c]) || {}).st || {}).bd;
+  chk([bd(0, 0), bd(1, 1), bd(2, 2)], ['tl', 'brtl', 'br'], 'outside borders around each of two overlapping ranges');
+  const th = M.styleOpsMulti(sh, [{ r1: 0, c1: 0, r2: 1, c2: 1 }, { r1: 1, c1: 1, r2: 2, c2: 2 }], (rect) => M.borderPatch(rect, 'thick', null));
+  const tbd = (r, c) => ((th.find((o) => o.k === sh.rows[r] + ':' + sh.cols[c]) || {}).st || {}).bd;
+  chk([tbd(0, 0), tbd(1, 1), tbd(1, 0), tbd(0, 1), tbd(2, 2)], ['TL', 'BRTL', 'BL', 'TR', 'BR'], 'thick outside borders around each of two overlapping ranges');
+  const th1 = M.borderOps(sh, { r1: 0, c1: 0, r2: 1, c2: 1 }, 'thick', null);
+  chk(th1.map((o) => o.st.bd), ['TL', 'TR', 'BL', 'BR'], 'thick outside border of one range as before');
+  const all = M.borderOps(sh, { r1: 0, c1: 0, r2: 1, c2: 1 }, 'all', '#ff0000');
+  chk(all.length === 4 && all.every((o) => o.st.bd === 'tlrb' && o.st.bc === '#ff0000'), true, 'borders of one range as before');
+  const dec = M.styleOpsMulti(sh, [{ r1: 0, c1: 0, r2: 0, c2: 0 }, { r1: 0, c1: 0, r2: 0, c2: 1 }], () => (st) => ({ dp: (st.dp || 0) + 1, nf: st.nf || 'gen' }));
+  chk(dec.map((o) => o.st.dp), [2, 1], 'a cell in two ranges is changed by both, once');
+});
 
 t('hidden rows (SUBTOTAL, AGGREGATE)', () => {
   // B2:B6 = 3, 5, 12, 20, empty; row 3 (Monitor, 5) filtered out, row 4 (Keyboard, 12) hidden by hand
@@ -236,6 +288,112 @@ t('hidden rows (SUBTOTAL, AGGREGATE)', () => {
   eq('=SUBTOTAL(9,B2:B7)', 40);
   delete s1.cells[k];
 });
+// ---------------------------------------------------------------- limits: hostile formulas finish quickly (1.2.6 audit)
+const quick = (label, fn, ms = 500) => {
+  const t0 = performance.now(); let got;
+  try { got = fn(); } catch (e) { got = 'threw ' + e.message; }
+  const took = performance.now() - t0;
+  results.push({ ok: got === true && took < ms, f: label, v: got === true ? Math.round(took) + ' ms' : got, expected: 'true in < ' + ms + ' ms' });
+};
+t('limits: text', () => {
+  eq('=LEN(REPT("ab",16383))', 32766); eq('=REPT("x",4E8)', '#VALUE!'); eq('=REPT("",1E300)', ''); eq('=REPT("x",-1)', '#VALUE!');
+  eq('=LEN("a"&REPT("b",32766))', 32767); eq('="a"&REPT("b",32767)', '#VALUE!');
+  eq('=SUBSTITUTE(REPT("a",30000),"a","bb")', '#VALUE!'); eq('=LEN(SUBSTITUTE(REPT("a",100),"a","bb"))', 200);
+  eq('=CONCAT(REPT("a",20000),REPT("a",20000))', '#VALUE!'); eq('=LEN(CONCAT(REPT("a",20000),REPT("a",12767)))', 32767);
+  eq('=TEXTJOIN(",",TRUE,REPT("a",20000),REPT("a",20000))', '#VALUE!');
+  eq('=BASE(5,2,300)', '#NUM!'); eq('=BASE(5,2,8)', '00000101'); eq('=FIXED(1,128)', '#VALUE!'); eq('=FIXED(1234.567,1)', '1,234.6');
+  eq('=TEXT(1,"d"&REPT(":",300))', '#VALUE!'); eq('=LEN(TEXT(1,"0."&REPT("0",200)))', 202);
+  const outOfRange = ev('=TEXT(1E9,"mmm")'); // eq() reads a leading # as an error code
+  results.push({ ok: outOfRange === '########', f: '=TEXT(1E9,"mmm")', v: outOfRange, expected: '########' });
+  eq('=TEXTBEFORE("a","",1E+300)', '#VALUE!'); eq('=TEXTAFTER("a","",1E+300)', '#VALUE!'); eq('=TEXTBEFORE("a-b-c","-",2)', 'a-b');
+  eq('=ADDRESS(1,16385)', '#VALUE!'); eq('=ADDRESS(1,1E308*10)', '#VALUE!'); eq('=ADDRESS(1048576,16384)', '$XFD$1048576');
+  eq('=INDEX({"a,b",2},1,1)', 'a,b'); eq('=COLUMNS({"x""y",1,"z"})', 3); eq("='abc", '#ERROR!');
+  quick('tokenize 30000 quotes', () => tokenize("'".repeat(30000)).length === 1);
+  quick('formula of 30000 quotes is an error', () => ev("='" + "'".repeat(30000)).code === '#ERROR!');
+  quick('literal of 32766 digits and a letter', () => literal('1'.repeat(32766) + 'x').length === 32767);
+  quick('VALUE of 30000 digits and a letter', () => ev('=VALUE(REPT("1",30000)&"x")').code === '#VALUE!');
+});
+t('limits: loops', () => {
+  eq('=FACTDOUBLE(1E+300)', '#NUM!'); eq('=FACT(1E+15)', '#NUM!'); eq('=FACT(171)', '#NUM!'); eq('=FACT(170)', 7.257415615307994e306);
+  eq('=FACTDOUBLE(7)', 105); eq('=PERMUT(1E+15,1E+15)', '#NUM!'); eq('=PERMUT(5,2)', 20);
+  eq('=BINOM.DIST(1E+15,1E+15,0.5,TRUE)', '#NUM!'); eq('=BINOM.DIST(2,4,0.5,TRUE)', 0.6875); eq('=POISSON.DIST(1E+15,1,TRUE)', '#NUM!'); eq('=POISSON.DIST(2,1,TRUE)', 0.9196986, 1e-6);
+  eq('=CUMIPMT(0.01,12,1000,1,1E+15,0)', '#NUM!'); eq('=CUMIPMT(0.01,12,1000,1E300,1E300,0)', '#NUM!'); eq('=CUMIPMT(0.1/12,36,8000,1,1,0)', -66.6667, 1e-5);
+  eq('=CUMPRINC(0.01,12,1000,1E300,1E300,0)', '#NUM!');
+  eq('=DDB(1000,0,10,1E+15)', '#NUM!'); eq('=DDB(2400,300,10,1)', 480); eq('=DB(1000,100,10,1E+15)', '#NUM!'); eq('=DB(1000000,100000,6,1,7)', 186083.3333, 1e-6);
+  eq('=NETWORKDAYS(0,1E+15)', '#NUM!'); eq('=WORKDAY(0,1E+300)', '#NUM!'); eq('=WORKDAY(0,1E308*10-1E308*10)', '#NUM!');
+  eq('=WORKDAY.INTL(DATE(2026,11,13),1,"1111111")', '#VALUE!'); eq('=WORKDAY.INTL(DATE(2026,11,13),1,"0000011")', 46342);
+  eq('=NETWORKDAYS(DATE(2026,11,16),DATE(2026,11,2))', -11);
+  eq('=SUM(FREQUENCY({1;2;3;4;5},{2;4}))', 5); eq('=INDEX(FREQUENCY({1;2;3;4;5},{4;2}),3)', 1);
+  quick('FREQUENCY of a million values in a million bins', () => ev('=ROWS(FREQUENCY(SEQUENCE(1000,1000),SEQUENCE(1000,1000)))') === 1000001, 3000);
+});
+t('limits: wildcards and regular expressions', () => {
+  eq('=COUNTIF(A2:A6,"*o*e*")', 1); eq('=COUNTIF(A2:A6,"?o*")', 2); eq('=COUNTIF(A2:A6,"~*")', 0); eq('=MATCH("k*",A2:A6,0)', 3);
+  eq('=SEARCH("b*c","aabxxc")', 3); eq('=SEARCH("?c","abcd")', 2); eq('=SEARCH("~?","a?b")', 2); eq('=SEARCH("*","abc",2)', 2);
+  eq('=COUNTIF("x",REPT("*",256))', '#VALUE!');
+  quick('COUNTIF *a*a…*b over 80 a', () => ev('=COUNTIF(REPT("a",80),"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b")') === 0);
+  quick('SEARCH *a*a…*b in 80 a', () => ev('=SEARCH("*a*a*a*a*a*a*a*a*a*a*a*a*b",REPT("a",80))').code === '#VALUE!');
+  quick('REGEXTEST ^(a+)+$ on 40 a and !', () => ev('=REGEXTEST(REPT("a",40)&"!","^(a+)+$")') === false);
+  quick('REGEXTEST a*a*a*a*a*b on 5000 a', () => ev('=REGEXTEST(REPT("a",5000)&"!","a*a*a*a*a*b")') === false);
+  eq('=REGEXEXTRACT("2026-11-25","(\\d+)-(\\d+)",2)', '2026'); eq('=REGEXREPLACE("a1b22","(\\d+)","<$1>")', 'a<1>b<22>');
+  eq('=REGEXREPLACE("a1b2","\\d","#",2)', 'a1b#'); eq('=REGEXTEST("ABC","b",1)', true); eq('=REGEXTEST("ABC","b")', false);
+  eq('=REGEXEXTRACT("x12y","\\d+?")', '1'); eq('=ROWS(REGEXEXTRACT("a1b22c333","\\d+",1))', 3); eq('=REGEXEXTRACT("color colour","colou?r")', 'color');
+  eq('=REGEXTEST("aa","(a)\\1")', '#VALUE!'); eq('=REGEXTEST("ab","a(?=b)")', '#VALUE!'); eq('=REGEXTEST("a","[")', '#VALUE!');
+  eq('=REGEXTEST("a",REPT("a",1001))', '#VALUE!');
+});
+t('limits: arrays and ranges', () => {
+  eq('=ROWS(RANDARRAY(100000,100000))', '#VALUE!'); eq('=ROWS(RANDARRAY(3,2))', 3); eq('=MUNIT(5000)', '#VALUE!'); eq('=SUM(MUNIT(3))', 3);
+  eq('=ROWS(EXPAND(1,1E+15,1))', '#VALUE!'); eq('=ROWS(EXPAND({1,2},3,2,0))', 3); eq('=ROWS(WRAPROWS(SEQUENCE(10),3))', 4);
+  eq('=ROWS(SEQUENCE(1000000)+SEQUENCE(1,1000000))', '#VALUE!'); eq('=SUM(SEQUENCE(3)+SEQUENCE(1,2))', 21);
+  eq('=ROWS(TEXTSPLIT("a,b;c",",",";"))', 2); eq('=CHOOSECOLS(SEQUENCE(1000,1000),SEQUENCE(1,5000,1,0))', '#VALUE!');
+  eq('=SUM(OFFSET(A1,0,0,1E+9,16384))', '#REF!'); eq('=ROWS(OFFSET(B2,0,0,1E+6))', 59); eq('=ROWS(A1:(XFD1048576))', 60); eq('=COLUMNS(A1:(XFD1048576))', 12);
+  eq('=SUM(MMULT({1,2;3,4},{5;6}))', 56); eq('=SUM(MMULT(SEQUENCE(600,600),SEQUENCE(600,600)))', '#CALC!'); eq('=1+1', 2);
+  eq('=SUM(XLOOKUP(SEQUENCE(3),{3;2;1;2},{10;20;30;40}))', 60); eq('=SUM(XLOOKUP(SEQUENCE(3),{3;2;1;2},{10;20;30;40},"no",0,-1))', 80);
+  eq('=SUM(XLOOKUP({"monitor";"zzz"},A2:A6,B2:B6,0))', 5);
+  quick('20000 exact XLOOKUPs', () => ev('=ROWS(XLOOKUP(SEQUENCE(20000),SEQUENCE(20000),SEQUENCE(20000)))') === 20000, 2000);
+  // array work that takes few steps but much time (a million values per call) still stops at the time limit
+  quick('400 nested TRANSPOSEs of a million values', () => { const v = ev('=SUM(' + 'TRANSPOSE('.repeat(400) + 'SEQUENCE(1000,1000)' + ')'.repeat(400) + ')'); return isErr(v) && v.code === '#CALC!'; }, 4000);
+  eq('=SUM(TRANSPOSE(TRANSPOSE(SEQUENCE(3,2))))', 21);
+});
+t('limits: defined names', () => {
+  const N = { N_4: '=1' };
+  ['N_3', 'N_2', 'N_1', 'N_0'].forEach((n, i) => { N[n] = '=SUM(' + Array(248).fill('N_' + (4 - i)).join(',') + ')'; });
+  Object.assign(doc.names, N);
+  quick('names that use names 248 times each', () => ev('=N_0') === 248 ** 4);
+  doc.names.LINKED = '=HYPERLINK("https://example.com/name","x")';
+  const k = s1.rows[52] + ':' + s1.cols[0];
+  s1.cells[k] = { v: '=LINKED' };
+  engine.invalidate();
+  const v = engine.valueAt(s1, 52, 0);
+  results.push({ ok: v === 'x' && engine.linkAt(s1, 52, 0) === null, f: 'a HYPERLINK in a name does not link the cell', v: [v, engine.linkAt(s1, 52, 0)], expected: ['x', null] });
+  delete s1.cells[k];
+  Object.keys(N).concat('LINKED').forEach((n) => { delete doc.names[n]; });
+  engine.invalidate();
+  engine.evalAt('=ISTEXT(HYPERLINK("https://example.com/cf","x"))', s1, 53, 0);
+  results.push({ ok: engine.linkAt(s1, 53, 0) === null, f: 'conditional formatting formulas set no links', v: engine.linkAt(s1, 53, 0), expected: null });
+});
+t('limits: input and display', () => {
+  const p = parseInput('$' + ' '.repeat(5000) + 'x', 'en-US');
+  results.push({ ok: p.kind === 'text', f: 'parse "$" + 5000 spaces + "x"', v: p.kind, expected: 'text' });
+  quick('parse "$" + 300000 spaces + "x"', () => parseInput('$' + ' '.repeat(300000) + 'x', 'en-US').kind === 'text');
+  quick('parse "%" + 2000 spaces + "x"', () => parseInput('%' + ' '.repeat(2000) + 'x', 'en-US').kind === 'text');
+  quick('DATEVALUE of "$" + 30000 spaces', () => ev('=DATEVALUE("$"&REPT(" ",30000)&"x")').code === '#VALUE!');
+  for (const [txt, raw, nf] of [['$ 12.50', '12.5', 'cur'], ['- 5%', '-0.05', 'pct'], ['12 %', '0.12', 'pct'], ['1 234 USD', '1234', 'cur'], ['%5', '0.05', 'pct']]) {
+    const q = parseInput(txt, 'en-US');
+    results.push({ ok: q.raw === raw && q.fmt && q.fmt.nf === nf, f: `parse "${txt}"`, v: q.raw + ' ' + (q.fmt && q.fmt.nf), expected: raw + ' ' + nf });
+  }
+  const fv = (v, st, exp) => { let got; try { got = formatValue(v, st, 'en-US'); } catch (e) { got = 'threw ' + e.message; } results.push({ ok: got === exp, f: `format ${JSON.stringify(v)} ${JSON.stringify(st)}`, v: got, expected: exp }); };
+  fv(1e9, { nf: 'custom', pat: 'mmm' }, '########'); fv(1.5, { nf: 'num', dp: 200 }, '1.5'); fv(2, { nf: 'custom', pat: '0.' + '0'.repeat(150) }, '2.' + '0'.repeat(150));
+  fv([], null, ''); fv({}, null, '');
+  results.push({ ok: editText(5, null, 'en-US') === '' && literal(5) === null, f: 'non-text stored values', v: [editText(5, null, 'en-US'), literal(5)], expected: ['', null] });
+  // damaged cells: a number instead of text, and a missing cell object
+  const a = s1.rows[54] + ':' + s1.cols[0], b = s1.rows[54] + ':' + s1.cols[1];
+  s1.cells[a] = { v: 5 }; s1.cells[b] = null;
+  engine.invalidate();
+  let got;
+  try { got = [engine.valueAt(s1, 54, 0), engine.valueAt(s1, 54, 1), engine.valueAt(s1, 55, 0)]; } catch (e) { got = 'threw ' + e.message; }
+  results.push({ ok: JSON.stringify(got) === '[null,null,null]', f: 'damaged cells read as empty', v: got, expected: [null, null, null] });
+  delete s1.cells[a]; delete s1.cells[b];
+});
 t('links', () => {
   const k = s1.rows[50] + ':' + s1.cols[0];
   s1.cells[k] = { v: '=HYPERLINK("javascript:alert(1)","bad")' };
@@ -245,6 +403,473 @@ t('links', () => {
   results.push({ ok: engine.linkAt(s1, 50, 0) === null, f: 'javascript: link refused', v: engine.linkAt(s1, 50, 0), expected: null });
   results.push({ ok: engine.linkAt(s1, 51, 0) === 'https://www.jetbrains.com', f: 'https link kept', v: engine.linkAt(s1, 51, 0), expected: 'https://www.jetbrains.com' });
   delete s1.cells[k]; delete s1.cells[s1.rows[51] + ':' + s1.cols[0]];
+});
+
+// ---------------------------------------------------------------- 1.2.6 regressions found in review (round 2)
+/** A workbook of its own: cells as { A1: raw } on sheet "Calc", optional names and one table { name, from, to }. */
+function book2(cells, opts = {}) {
+  const sh = Core.newSheet('Calc', opts.rows || 20, opts.cols || 10);
+  for (const [a, v] of Object.entries(cells)) { const p = parseAddr(a); sh.cells[sh.rows[p.r] + ':' + sh.cols[p.c]] = { v: String(v) }; }
+  if (opts.table) {
+    const p1 = parseAddr(opts.table.from), p2 = parseAddr(opts.table.to);
+    sh.tables = [{ id: 'r2', name: opts.table.name, r1: sh.rows[p1.r], c1: sh.cols[p1.c], r2: sh.rows[p2.r], c2: sh.cols[p2.c], header: true }];
+  }
+  const d = { sheets: [sh], names: opts.names || {} };
+  // opts.filtered: table filters hide rows for SUBTOTAL, kept once computed as the widget does (app.js rowHidden)
+  let rowsHidden = null;
+  const rowHidden = (s, r) => {
+    let rows = rowsHidden;
+    if (!rows) { rows = M.filteredRows(eng, s, 1, 'en-US'); if (!budgetSpent()) rowsHidden = rows; }
+    return rows.has(r) ? 'filter' : rows.unknown && rows.unknown.has(r) ? 'unknown' : null;
+  };
+  const eng = new Engine({ sheets: d.sheets, names: d.names, findTable: (n) => M.findTable(eng, d, n, 1, 'en-US'), tableAt: (s, r, c) => M.tableAt(eng, s, r, c, 1, 'en-US'), rowHidden: opts.filtered ? rowHidden : undefined }, 'en-US');
+  const at = (a) => { const p = parseAddr(a); return eng.valueAt(sh, p.r, p.c); };
+  const set = (a, v) => { const p = parseAddr(a); sh.cells[sh.rows[p.r] + ':' + sh.cols[p.c]] = { v: String(v) }; };
+  // every cell row by row, as the grid draws them
+  const draw = () => { for (let r = 0; r < sh.rows.length; r++) for (let c = 0; c < sh.cols.length; c++) eng.valueAt(sh, r, c); };
+  return { sh, eng, at, set, draw };
+}
+/** A value as these tests compare it: errors by code, " (slow)" for the #CALC! of the work budget, numbers rounded. */
+const shown = (v) => (isErr(v) ? v.code + (isSlowCalc(v) ? ' (slow)' : '') : typeof v === 'number' ? +v.toPrecision(12) : v);
+const same = (label, got, exp) => results.push({ ok: JSON.stringify(got) === JSON.stringify(exp), f: label, v: got, expected: exp });
+/** Waits for the next burst: the work budget is whole again, computed values stay. */
+const burst = () => new Promise((r) => setTimeout(r, 0));
+/** Draws in new bursts as the widget does (app.js continueCalc): again while a draw used up the budget and kept more
+ * values than the one before, at most 20 times. Returns the number of draws. */
+async function rounds(g, drawOnce = g.draw) {
+  let kept = -1;
+  for (let n = 1; ; n++) {
+    await burst();
+    drawOnce();
+    const now = g.eng.progress();
+    if (!budgetSpent() || now <= kept || n > 20) return n;
+    kept = now;
+  }
+}
+
+t('spill scan: formulas right of an empty cell are not evaluated for it (no false #CIRC!)', () => {
+  const draw = (cells, opts, cellsToRead) => { const g = book2(cells, opts); g.draw(); return cellsToRead.map((a) => shown(g.at(a))); };
+  // a total left of a SEQUENCE that uses it, reading a column with a blank
+  same('scan: SEQUENCE right of its total', draw({ A1: '=SUM(A2:A6)', A2: '1', A3: '2', A5: '4', A6: '5', C1: '=SEQUENCE(1,3,A1)' }, {}, ['A1', 'C1', 'D1', 'E1']), [12, 12, 13, 14]);
+  // a defined name for the total, shares below it, one blank
+  const nameCells = { A1: 'Total', B1: '=SUM(B3:B12)' };
+  for (let i = 0; i < 10; i++) { const r = i + 3; nameCells['A' + r] = 'Item ' + i; if (i !== 3) nameCells['B' + r] = String(i + 1); nameCells['C' + r] = '=B' + r + '/TOTAL'; }
+  same('scan: shares of a named total', draw(nameCells, { names: { TOTAL: '=Calc!$B$1' } }, ['C3', 'C4', 'C5', 'C6', 'C7']), [0.0196078431373, 0.0392156862745, 0.0588235294118, 0, 0.0980392156863]);
+  // a table: Total = [@Qty]*[@Price], Share = [@Total]/SUM([Total]), one blank price
+  const tbl = { A1: 'Item', B1: 'Qty', C1: 'Price', D1: 'Total', E1: 'Share' };
+  [['Pen', 2, 3], ['Ink', 1, ''], ['Pad', 4, 5], ['Cap', 3, 2], ['Box', 1, 9]].forEach(([a, b, c], i) => {
+    const r = i + 2; tbl['A' + r] = a; tbl['B' + r] = b; if (c !== '') tbl['C' + r] = c;
+    tbl['D' + r] = '=[@Qty]*[@Price]'; tbl['E' + r] = '=[@Total]/SUM([Total])';
+  });
+  same('scan: table share with a blank price', draw(tbl, { table: { name: 'Orders', from: 'A1', to: 'E6' } }, ['E2', 'E3', 'E4']), [0.146341463415, 0, 0.487804878049]);
+  // running totals with INDEX next to a share of the total
+  const run = { A1: 'Amount', B1: 'Running', C1: 'Pct', E1: '=SUM(A2:A9)' };
+  [5, 7, '', 3, 8, '', 2, 4].forEach((v, i) => { const r = i + 2; if (v !== '') run['A' + r] = String(v); run['B' + r] = '=SUM(INDEX(A:A,2):A' + r + ')'; run['C' + r] = '=B' + r + '/INDEX(E:E,1)'; });
+  same('scan: running totals with INDEX', draw(run, {}, ['C2', 'C3', 'C4', 'C5', 'C9']), [0.172413793103, 0.413793103448, 0.413793103448, 0.51724137931, 1]);
+  // a FILTER right of the total it uses
+  const flt = { A1: 'Total', B1: '=SUM(B3:B12)' };
+  ['Apple', 'Pear', 'Plum', 'Fig', 'Kiwi', 'Lime', 'Date', 'Nut', 'Yam', 'Bean'].forEach((n, i) => { flt['A' + (i + 3)] = n; if (i !== 4) flt['B' + (i + 3)] = String((i + 1) * 10); });
+  flt.D3 = '=FILTER(A3:B12,B3:B12>B1/10)';
+  same('scan: FILTER right of its total', draw(flt, {}, ['B1', 'D3', 'E3', 'D7', 'E7', 'D8']), [500, 'Lime', 60, 'Bean', 100, null]);
+  // XLOOKUP shares of a total in the first row
+  const xl = { A1: 'Code', B1: 'Price', D1: 'Order', E1: 'Price', F1: '=SUM(E2:E6)', G1: 'Share' };
+  ['a', 'b', 'c', 'd', 'e'].forEach((k, i) => { xl['A' + (i + 2)] = k; xl['B' + (i + 2)] = String((i + 1) * 3); });
+  ['c', 'a', 'e', 'b', 'd'].forEach((k, i) => { const r = i + 2; xl['D' + r] = k; xl['E' + r] = '=XLOOKUP(D' + r + ',A:A,B:B)'; xl['G' + r] = '=XLOOKUP(D' + r + ',A:A,B:B)/F1'; });
+  same('scan: XLOOKUP shares', draw(xl, { rows: 30 }, ['G2', 'G3', 'G4', 'G5', 'G6']), [0.2, 0.0666666666667, 0.333333333333, 0.133333333333, 0.266666666667]);
+  // a spill sized by a total of another spill
+  same('scan: spill sized by a total', draw({ A1: '=SEQUENCE(3)', B1: '=SUM(A1:A5)', C1: '=SEQUENCE(B1,1)', D3: '=SUM(C1:C9)' }, {}, ['B1', 'C1', 'C6', 'D3']), [6, 1, 6, 21]);
+  // unchanged: spill chains, blocked spills and real cycles
+  same('scan: spill chain', draw({ A1: '=SEQUENCE(5)', B1: '=A1#*2', C1: '=SUM(B1#)', D1: '=ROWS(A1#)', E3: '=A3+B3', F1: '=SORT(A1:A5,1,-1)', A8: '=SUM(A1:A6)' }, {}, ['B5', 'C1', 'D1', 'E3', 'F1', 'F5', 'A8']), [10, 30, 5, 9, 5, 1, 15]);
+  same('scan: blocked spills', draw({ A1: '=SEQUENCE(3)', A3: 'x', C1: '=SEQUENCE(2,2)', D2: '=1', E5: '=SEQUENCE(2)', E6: '=SEQUENCE(2)' }, {}, ['A1', 'A2', 'C1', 'E5', 'E6', 'E7']), ['#SPILL!', null, '#SPILL!', '#SPILL!', 1, 2]);
+  same('scan: a real cycle', draw({ A1: '=B1+1', B1: '=A1+1', C1: '=SEQUENCE(2)+A1' }, {}, ['A1', 'B1', 'C1']), ['#CIRC!', '#CIRC!', '#CIRC!']);
+  quick('20000 rows of spill candidates next to empty cells', () => {
+    const cells = {};
+    for (let r = 1; r <= 20000; r++) { cells['A' + r] = 'K' + r; cells['B' + r] = String(r % 97); cells['C' + r] = '=INDEX(B:B,ROW())'; cells['E' + r] = '=C' + r + '+D' + r; cells['F' + r] = '=ROW()'; }
+    const g = book2(cells, { rows: 20005, cols: 8 });
+    g.draw();
+    return g.at('E5') === 5 && g.at('F2') === 2;
+  }, 3000);
+});
+
+// the work budget (3e7 steps per burst): MDETERM of a zero matrix counts n^3 / 4 steps and returns at once
+const HEAVY = '=MDETERM(SEQUENCE(500,500,0,0))';  // 31.5 million steps: more than a whole burst
+const HALF = 'MDETERM(SEQUENCE(400,400,0,0))';    // 16.2 million steps: more than half a burst
+try {
+  // typed values are read as usual after the budget is spent; a formula over the budget on its own is kept as #CALC!
+  // and the next burst computes the formulas after it
+  let g = book2({ A1: 'Heavy', B1: HEAVY, A2: 'Item', B2: 'Qty', A3: 'Pen', B3: '12', C3: '=B3*2', A4: 'Ink', B4: '7', C4: '=B4*2', A5: '2026-11-25', B5: 'TRUE' });
+  await burst();
+  g.draw();
+  same('budget: typed values after the budget is spent', [shown(g.at('B1')), budgetSpent(), shown(g.at('A3')), shown(g.at('B3')), shown(g.at('A5')), shown(g.at('B5')), shown(g.at('C3'))],
+    ['#CALC! (slow)', true, 'Pen', 12, '2026-11-25', true, '#CALC! (slow)']);
+  await burst();
+  g.draw();
+  same('budget: the next burst computes what follows a formula too heavy', [shown(g.at('B1')), shown(g.at('C3')), shown(g.at('C4')), budgetSpent()], ['#CALC! (slow)', 24, 14, false]);
+  g = book2({ A1: 'Heavy', B1: HEAVY, B3: '12', C3: '=B3*2' });
+  let drawn = null;
+  const n2 = await rounds(g, () => { g.draw(); drawn = shown(g.at('C3')); });
+  same('budget: draws as the widget does', [n2, drawn], [2, 24]);
+
+  // two formulas too heavy behind a conditional formatting formula that takes more than half a burst: its result is
+  // kept (evalAt with keep), so each later draw starts the next formula too heavy with the whole budget and keeps it as
+  // #CALC!; the draws do not stop before the formulas after them
+  g = book2({ B1: HEAVY, D1: HEAVY, B3: '12', C3: '=B3*2' });
+  const draws = await rounds(g, () => { g.eng.evalAt('=' + HALF + '=0', g.sh, 0, 0, 'cf1f'); g.draw(); });
+  same('budget: formulas too heavy after conditional formatting', [draws, shown(g.at('B1')), shown(g.at('D1')), shown(g.at('C3'))], [4, '#CALC! (slow)', '#CALC! (slow)', 24]);
+  // a cheap formula after conditional formatting that takes nearly the whole budget is not taken for one too heavy: it
+  // is computed in the next draw (and a command that reads it later gets its value)
+  g = book2({ B2: '=MDETERM(SEQUENCE(150,150,0,0))+1' });
+  const cfNear = '=MDETERM(SEQUENCE(488,488,0,0))=0'; // 29.3 million steps: all but 0.7 million of the budget
+  const n3 = await rounds(g, () => { g.eng.evalAt(cfNear, g.sh, 0, 0, 'cf2f'); g.draw(); });
+  await burst();
+  same('budget: a cheap formula after heavy conditional formatting', [n3, shown(g.at('B2'))], [2, 1]);
+
+  // a formula too heavy that only other formulas read (drawn last): kept as #CALC! the first time, so that its 30
+  // readers take two draws, not one draw each
+  const readers = { J20: HEAVY, J1: '=SUM(J2:J5)', J2: '1' };
+  for (let r = 1; r <= 30; r++) readers['A' + r] = '=J20*' + r;
+  g = book2(readers, { rows: 40, cols: 10 });
+  same('budget: a formula too heavy read by 30 others', [await rounds(g), shown(g.at('A1')), shown(g.at('A30')), shown(g.at('J20')), shown(g.at('J1'))], [2, '#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', 1]);
+
+  // reading the typed values of another sheet after the budget is spent (as an export does)
+  g = book2({ A1: HEAVY, C1: 'Code', D1: 'Ayşe Yılmaz', C2: '12', D2: 'FALSE', C3: '#N/A' });
+  await burst();
+  same('budget: typed values of a later read', ['A1', 'C1', 'D1', 'C2', 'D2', 'C3', 'C4'].map((a) => shown(g.at(a))), ['#CALC! (slow)', 'Code', 'Ayşe Yılmaz', 12, false, '#N/A', null]);
+
+  // a spill computed when the budget ran out inside it keeps nothing; a later, smaller spill reads fine
+  g = book2({ A1: '=' + HALF, B1: '1', B2: '2', B3: '3', B4: '4', B5: '=IF(' + HALF + '=0,4,0)', A3: '=UNIQUE(B1:B5)' });
+  const look = (cells) => { try { g.draw(); return cells.map((a) => shown(g.at(a))); } catch (e) { return 'threw ' + e.message; } };
+  await burst();
+  same('budget: a stopped spill leaves nothing', look(['A3', 'A4', 'A7', 'B5']), ['#CALC! (slow)', null, null, '#CALC! (slow)']);
+  await burst();
+  same('budget: a smaller spill after a stopped one', look(['A3', 'A4', 'A5', 'A6', 'A7', 'B5']), [1, 2, 3, 4, null, 4]);
+
+  // a formula stopped by the budget inside a lifted function (which turns the stop into one #CALC! per element and
+  // goes on) gives the budget's #CALC! and spills nothing; the same inside a defined name
+  const STOPPED = 'REGEXTEST(IF(MDETERM(SEQUENCE(490,490,0,0))=0,REPT("a",3000)&SEQUENCE(100)),"a+\\d")';
+  g = book2({ A1: '=' + STOPPED, C1: '=CUT' }, { rows: 120, names: { CUT: '=' + STOPPED } });
+  await burst();
+  same('budget: stopped inside a lifted function', [shown(g.at('A1')), g.eng.spillAt(g.sh, 0, 0), shown(g.at('A2'))], ['#CALC! (slow)', null, null]);
+  await burst();
+  same('budget: stopped inside a defined name', [shown(g.at('C1')), shown(g.at('C2'))], ['#CALC! (slow)', null]);
+
+  // a formula that reads the #CALC! of a formula too heavy is #CALC! itself (kept as well): through operators, lifted
+  // functions, spills (which spill nothing then) and names
+  g = book2({ B1: HEAVY, B2: '5', B3: '7', C1: '=B1*2', C2: '=ABS(B1:B3)', D1: '=B1:B3', E1: '=HB', E2: '=SUM(HB,1)' }, { names: { HB: '=Calc!$B$1' } });
+  await burst();
+  g.at('B1');
+  await burst();
+  g.draw();
+  same('budget: users of a formula too heavy', ['B1', 'C1', 'C2', 'C3', 'C4', 'D1', 'D2', 'E1', 'E2'].map((a) => shown(g.at(a))),
+    ['#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', null, null, '#CALC! (slow)', null, '#CALC! (slow)', '#CALC! (slow)']);
+
+  // also where IFERROR, ISERROR, COUNT or AGGREGATE would turn that #CALC! into a value (which commands would then sort,
+  // total or export), in names and in formulas outside cells; a formula that does not read it is computed
+  g = book2({
+    B1: HEAVY, B2: '5', B3: '7', C1: '=IFERROR(B1,0)', C2: '=ISERROR(B1)', C3: '=COUNT(B1:B3)', C4: '=AGGREGATE(9,6,B1:B3)',
+    C5: '=IF(ISNUMBER(B1),"n","check")', C6: '=IF(FALSE,B1,1)', C7: '=IFERROR(HB,0)', C8: '=SUM(B2:B3)', C9: '=C1+1'
+  }, { names: { HB: '=IFERROR(Calc!$B$1,0)' } });
+  await burst();
+  g.at('B1');
+  await burst();
+  g.draw();
+  same('budget: what is built from a formula too heavy', ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9'].map((a) => shown(g.at(a))),
+    ['#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', 1, '#CALC! (slow)', 12, '#CALC! (slow)']);
+  same('budget: formulas outside cells built from a formula too heavy', [shown(g.eng.evalAt('=IFERROR(B1,0)=0', g.sh, 0, 0, 'cf3f')), g.eng.evalAt('=B2>3', g.sh, 0, 0, 'cf4f')], ['#CALC! (slow)', true]);
+
+  // a spill formula too heavy spills nothing (like a formula with any other error). Drawn, the cells it could cover are
+  // empty; a formula that reads one of them is not known either (#CALC!), one that reads cells above or left of it is
+  g = book2({ A1: '=IF(' + HEAVY.slice(1) + '=0,SEQUENCE(3))', C1: '=COUNTA(A1:A5)', C2: '=SUM(A2:A5)', C3: '=COUNTA(A2:A5)', E5: '7', F6: '=SUM(E5:E6)' }, { rows: 12, cols: 8 });
+  await burst();
+  g.at('A1');
+  await burst();
+  g.draw();
+  same('budget: a spill formula too heavy', ['A1', 'A2', 'C1', 'C2', 'C3', 'F6'].map((a) => shown(g.at(a))), ['#CALC! (slow)', null, '#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)', 7]);
+  g = book2({ D4: '=IF(' + HEAVY.slice(1) + '=0,SEQUENCE(3))', A1: '3', A2: '4', B1: '=SUM(A1:A9)', E1: '=SUM(A1:C3)', H1: '=COUNTA(D1:D3)' }, { rows: 12, cols: 8 });
+  await burst();
+  g.at('D4');
+  await burst();
+  g.draw();
+  same('budget: cells above or left of a spill formula too heavy', ['D4', 'B1', 'E1', 'H1'].map((a) => shown(g.at(a))), ['#CALC! (slow)', 7, 14, 0]);
+
+  // a formula that needs nearly the whole budget, after another formula in the same burst: computed in the next burst
+  // (not kept as too heavy), and the same formula elsewhere gives the same value
+  g = book2({ A1: '=MDETERM(SEQUENCE(90,90,0,0))', B1: '=MDETERM(SEQUENCE(491,491,0,0))', B3: '=MDETERM(SEQUENCE(491,491,0,0))', C1: '=1+1' });
+  const nNear = await rounds(g);
+  same('budget: a formula that needs nearly the whole budget', [shown(g.at('A1')), shown(g.at('B1')), shown(g.at('B3')), shown(g.at('C1')), g.eng.heavyFound() === 0, nNear >= 2], [0, 0, 0, 2, true, true]);
+
+  // formulas outside cells: the cells they read count against the budget, so one over a big range is stopped like a cell
+  // formula (it ran unchecked to the end before)
+  {
+    const big = {};
+    for (let r = 1; r <= 5000; r++) for (let c = 0; c < 26; c++) big[colName(c) + r] = '1';
+    g = book2(big, { rows: 5000, cols: 26 });
+    const f = '=SUM(' + Array(250).fill('COUNTIF($A$1:$Z$5000,">0")').join(',') + ')>0';
+    await burst();
+    const t1 = performance.now(), v1 = g.eng.evalAt(f, g.sh, 0, 0, 'cfBig', true), ms1 = performance.now() - t1;
+    await burst();
+    const t2 = performance.now(), v2 = g.eng.evalAt(f, g.sh, 1, 0, 'cfBig', true), ms2 = performance.now() - t2;
+    same('budget: a heavy formula outside cells is stopped', [shown(v1), ms1 < 2500, shown(v2), ms2 < 50], ['#CALC! (slow)', true, '#CALC! (slow)', true]);
+    // kept results of a rule are under its group, not under its formula text (which may be 8000 characters long)
+    await burst();
+    const longF = '=A1+0*LEN("' + 'x'.repeat(8000) + '")>0';
+    for (let r = 0; r < 40; r++) g.eng.evalAt(longF, g.sh, r, 0, 'cfLong');
+    const keys = [...g.eng.atCache.keys()].filter((k) => k[0] === '@');
+    same('budget: kept results of a rule are under short keys', [keys.length >= 40, keys.every((k) => k.length < 40)], [true, true]);
+    await burst();
+  }
+
+  // a defined name too heavy to compute is found once (not once for each cell that uses it)
+  {
+    const cells = {};
+    for (let r = 1; r <= 30; r++) cells['A' + r] = '=HEAVYNAME+' + r;
+    cells.C1 = '=1+1';
+    g = book2(cells, { rows: 40, names: { HEAVYNAME: '=MDETERM(SEQUENCE(500,500,0,0))' } });
+    const nName = await rounds(g);
+    same('budget: a defined name too heavy', [nName <= 3, shown(g.at('A1')), shown(g.at('A30')), shown(g.at('C1'))], [true, '#CALC! (slow)', '#CALC! (slow)', 2]);
+  }
+
+  // SUBTOTAL over a filtered table whose filter column has a formula too heavy: whether its row is hidden is not known,
+  // so every SUBTOTAL that covers it is #CALC!, whichever formula built the filter first
+  {
+    g = book2({ A1: 'Amount', B1: 'Score', A2: '10', B2: '1', A3: '20', B3: HEAVY, A4: '30', B4: '-1', A5: '40', B5: '2', A6: '50', B6: '-5', D1: '=SUBTOTAL(9,A2:A6)', D2: '=SUBTOTAL(9,A2:A6)', D3: '=SUM(A2:A6)' },
+      { table: { name: 'T', from: 'A1', to: 'B6' }, filtered: true });
+    g.sh.tables[0].filters = { [g.sh.cols[1]]: { cond: { op: 'gt', a: '0' } } };
+    await burst();
+    g.at('B3');
+    await burst();
+    const d1 = shown(g.at('D1')), d2 = shown(g.at('D2')), d3 = shown(g.at('D3'));
+    same('budget: SUBTOTAL over a filter that reads a formula too heavy', [d1, d2, d3], ['#CALC! (slow)', '#CALC! (slow)', 150]);
+  }
+
+  // formulas that read many cells before a formula too heavy: that one is found once (it starts the next burst with
+  // the whole budget) and they are #CALC! after it, instead of each of them being found heavy on its own
+  {
+    const cells = { J20: HEAVY, C1: '=1+1' };
+    for (let r = 1; r <= 30; r++) cells['A' + r] = '=SUM($B$1:$B$19990)+J20*' + r;
+    for (let r = 1; r <= 19990; r += 7) cells['B' + r] = '1';
+    g = book2(cells, { rows: 20000, cols: 12 });
+    const nReaders = await rounds(g, () => { for (let r = 0; r < 40; r++) for (let c = 0; c < 12; c++) g.eng.valueAt(g.sh, r, c); });
+    same('budget: readers of a formula too heavy that read a lot first', [nReaders <= 3, g.eng.keptSlow(g.sh, 19, 9), shown(g.at('A1')), shown(g.at('A30')), shown(g.at('C1')), g.eng.heavyFound()], [true, true, '#CALC! (slow)', '#CALC! (slow)', 2, 1]);
+  }
+
+  // a table whose price is too heavy: its row's Total is #CALC!, but formulas that read other cells of the table are
+  // computed ([@Col] references give one value each, they do not spill)
+  {
+    const cells = { A1: 'Item', B1: 'Qty', C1: 'Price', D1: 'Total', E1: 'Note', G1: '=COUNTBLANK(E2:E8)', G2: '=COUNTA(E2:E8)', G3: '=SUM(D2:D8)', G4: '=H20+1', G5: '=IF(E5="","none",E5)' };
+    for (let r = 2; r <= 8; r++) { cells['A' + r] = 'i' + r; cells['B' + r] = '1'; cells['C' + r] = r === 4 ? HEAVY : '2'; cells['D' + r] = '=[@Qty]*[@Price]'; }
+    cells.E3 = 'note';
+    g = book2(cells, { rows: 30, cols: 10, table: { name: 'Orders', from: 'A1', to: 'E8' } });
+    await rounds(g);
+    same('budget: a table with a price too heavy', ['C4', 'D4', 'D5', 'G1', 'G2', 'G3', 'G4', 'G5'].map((a) => shown(g.at(a))), ['#CALC! (slow)', '#CALC! (slow)', 2, 6, 1, '#CALC! (slow)', 1, 'none']);
+  }
+
+  // a defined name that depends on where it is used, too heavy in one cell only: #CALC! there, computed elsewhere
+  {
+    const cells = {};
+    for (let r = 1; r <= 10; r++) cells['A' + r] = '=RN';
+    g = book2(cells, { rows: 12, names: { RN: '=IF(ROW()=5,MDETERM(SEQUENCE(500,500,0,0)),ROW()*10)' } });
+    await rounds(g);
+    same('budget: a name too heavy in one cell', ['A1', 'A4', 'A5', 'A6', 'A10'].map((a) => shown(g.at(a))), [10, 40, '#CALC! (slow)', 60, 100]);
+  }
+
+  // conditional formatting: a rule too heavy in one cell only is not applied there, and is applied in the others; a
+  // rule whose threshold is too heavy applies to no cell (not to every cell, as an error would compare)
+  {
+    const cells = {};
+    for (let r = 1; r <= 10; r++) cells['A' + r] = String(r);
+    g = book2(cells, { rows: 12, cols: 4 });
+    const id = (a) => { const p = parseAddr(a); return [g.sh.rows[p.r], g.sh.cols[p.c]]; };
+    const [b1r, b1c] = id('B1'), [b10r] = id('B10'), [a1r, a1c] = id('A1');
+    g.sh.cf = [
+      { id: 'cfp', r1: b1r, c1: b1c, r2: b10r, c2: b1c, type: 'formula', formula: '=IF($A1=5,MDETERM(SEQUENCE(500,500,0,0)),$A1)>3', style: { bg: '#f4cccc' } },
+      { id: 'cft', r1: a1r, c1: a1c, r2: b10r, c2: a1c, type: 'lt', a: '=MDETERM(SEQUENCE(500,500,0,0))+5', style: { bg: '#d9ead3' } }
+    ];
+    const cache = new Map();
+    const cfDraw = () => { const out = []; for (let r = 0; r < 10; r++) out.push(M.cfFor(g.eng, g.sh, r, 1, M.indexOf(g.sh, 1), cache) ? 1 : 0); for (let r = 0; r < 10; r++) out.push(M.cfFor(g.eng, g.sh, r, 0, M.indexOf(g.sh, 1), cache) ? 1 : 0); return out.join(''); };
+    let marks = '';
+    for (let n = 0; n < 8; n++) { await burst(); marks = cfDraw(); if (!budgetSpent()) break; }
+    same('budget: conditional formatting too heavy in one cell, and a threshold too heavy', marks, '0001011111' + '0000000000');
+  }
+
+  // many formulas kept as #CALC! that may spill, read one by one: each read stays quick
+  {
+    const cells = { Z1: HEAVY, Y1: '=COUNTA(B1:B20000)' };
+    for (let r = 1; r <= 20000; r++) cells['A' + r] = '=IF($Z$1=0,SEQUENCE(1),0)';
+    g = book2(cells, { rows: 20000, cols: 26 });
+    await burst();
+    g.at('Z1');
+    let t = 0, y1;
+    for (let n = 0; n < 10; n++) { await burst(); const t0 = performance.now(); y1 = g.at('Y1'); t += performance.now() - t0; if (!budgetSpent()) break; }
+    same('budget: many spill formulas kept as #CALC!', [shown(y1), t < 1500], ['#CALC! (slow)', true]);
+  }
+
+  // time wasted on a formula the budget stops counts from the last formula computed, also when the stopped one computed
+  // a formula it reads first (the drawing's limit on wasted time must not be dodged that way)
+  {
+    const cells = { B1: '=ROW()', A1: '=SUM(B1)+' + HEAVY.slice(1) };
+    g = book2(cells, { rows: 5 });
+    await burst();
+    const w0 = g.eng.wasted();
+    const t0 = performance.now(); g.at('A1'); const dt = performance.now() - t0;
+    same('budget: waste after a formula computed first', [shown(g.at('B1')), g.eng.wasted() - w0 > 0, g.eng.wasted() - w0 <= dt + 1], [1, true, true]);
+  }
+
+  // a defined name that depends on the cell through another name is not taken for one that gives the same everywhere
+  {
+    const cells = {};
+    for (let r = 1; r <= 10; r++) cells['C' + r] = '=NNAME';
+    g = book2(cells, { rows: 12, names: { RTWICE: '=ROW()*2', NNAME: '=IF(RTWICE=10,MDETERM(SEQUENCE(500,500,0,0)),RTWICE)' } });
+    await rounds(g);
+    same('budget: a name that depends on the cell through another name', ['C1', 'C4', 'C5', 'C6', 'C10'].map((a) => shown(g.at(a))), [2, 8, '#CALC! (slow)', 12, 20]);
+  }
+
+  // a formula too heavy in every cell that depends on the position is found too heavy for all of them after a few cells
+  {
+    const cells = {};
+    for (let r = 1; r <= 30; r++) cells['A' + r] = '=HN';
+    cells.C1 = '=1+1';
+    g = book2(cells, { rows: 40, names: { HN: '=MDETERM(SEQUENCE(500,500,0,0))+ROW()' } });
+    const nHN = await rounds(g);
+    same('budget: a name too heavy everywhere that depends on the cell', [nHN <= 5, shown(g.at('A1')), shown(g.at('A30')), shown(g.at('C1'))], [true, '#CALC! (slow)', '#CALC! (slow)', 2]);
+  }
+
+  // functions that give one value are not taken for arrays that could spill over the cells next to them
+  {
+    g = book2({ A1: '=ROW()+' + HEAVY.slice(1), C1: '=COUNTA(A2:A5)', D1: '=PERCENTILE.INC(B1:B3,0.5)+' + HEAVY.slice(1), D2: '=E2+1' }, { rows: 8, cols: 6 });
+    await rounds(g);
+    same('budget: one-value formulas too heavy do not spill', ['A1', 'C1', 'D1', 'D2'].map((a) => shown(g.at(a))), ['#CALC! (slow)', 0, '#CALC! (slow)', 1]);
+  }
+
+  // a rule or name too heavy in one row only, used in several columns of that row: only that row is not computed (three
+  // heavy cells in a row do not make it too heavy everywhere once it was computed somewhere)
+  {
+    const cells = {};
+    for (let r = 1; r <= 12; r++) { cells['A' + r] = '=RN+0'; cells['B' + r] = '=RN+1'; cells['C' + r] = '=RN+2'; cells['E' + r] = String(r); }
+    g = book2(cells, { rows: 14, cols: 8, names: { RN: '=IF(ROW()=5,MDETERM(SEQUENCE(500,500,0,0)),ROW()*10)' } });
+    await rounds(g);
+    same('budget: a name too heavy in one row, used three times in it', ['A4', 'C4', 'A5', 'C5', 'A6', 'C12'].map((a) => shown(g.at(a))), [40, 42, '#CALC! (slow)', '#CALC! (slow)', 60, 122]);
+    const id = (a) => { const p = parseAddr(a); return [g.sh.rows[p.r], g.sh.cols[p.c]]; };
+    const [f1r, f1c] = id('F1'), [h10r, h10c] = id('H10');
+    g.sh.cf = [{ id: 'cfrow', r1: f1r, c1: f1c, r2: h10r, c2: h10c, type: 'formula', formula: '=IF($E1=5,MDETERM(SEQUENCE(500,500,0,0)),$E1)>3', style: { bg: '#f4cccc' } }];
+    const cache = new Map();
+    const row = (r) => [5, 6, 7].map((c) => (M.cfFor(g.eng, g.sh, r, c, M.indexOf(g.sh, 1), cache) ? 1 : 0)).join('');
+    let marks = '';
+    for (let n = 0; n < 10; n++) { await burst(); marks = [0, 3, 4, 5, 9].map(row).join(' '); if (!budgetSpent()) break; }
+    same('budget: conditional formatting too heavy in one row of three columns', marks, '000 111 000 111 111');
+  }
+
+  // a defined name is evaluated on the sheet of the cell that uses it: too heavy on one sheet, it is computed on another
+  {
+    const one = Core.newSheet('One', 4, 4), two = Core.newSheet('Two', 4, 4);
+    const put = (sh, a, v) => { const p = parseAddr(a); sh.cells[sh.rows[p.r] + ':' + sh.cols[p.c]] = { v }; };
+    put(one, 'A1', '5'); put(one, 'B1', '=NQ'); put(two, 'A1', '3'); put(two, 'B1', '=NQ');
+    const eng = new Engine({ sheets: [one, two], names: { NQ: '=IF($A$1=5,MDETERM(SEQUENCE(500,500,0,0)),$A$1)' } }, 'en-US');
+    let a = null, b = null;
+    for (let n = 0; n < 6; n++) { await burst(); a = eng.valueAt(one, 0, 1); b = eng.valueAt(two, 0, 1); if (!budgetSpent()) break; }
+    same('budget: a name too heavy on one sheet only', [shown(a), shown(b)], ['#CALC! (slow)', 3]);
+  }
+
+  // MATCH, VLOOKUP and HLOOKUP of several lookup values give an array, which spills: a cell it covers reads its value
+  // whatever is read first, and one next to such a spill too heavy to compute is not known
+  {
+    g = book2({ A10: '5', A11: '1', A12: '3', A13: '9', A14: '7', C2: '=B2+1', B1: '=MATCH(A10:A12,A10:A14,0)' }, { rows: 16, cols: 4 });
+    const first = shown(g.at('C2'));
+    same('spill: MATCH of several values, read from a cell it covers first', [first, shown(g.at('B2'))], [3, 2]);
+    g = book2({ A10: '5', A11: '1', A12: '3', A13: '9', A14: '7', C2: '=B2+1', C3: '=COUNTA(B2:B3)', B1: '=MATCH(A10:A12,A10:A14,0)+0*SUMPRODUCT(MDETERM(SEQUENCE(500,500,0,0)))' }, { rows: 16, cols: 4 });
+    await rounds(g);
+    same('budget: a MATCH spill too heavy', ['B1', 'C2', 'C3'].map((a) => shown(g.at(a))), ['#CALC! (slow)', '#CALC! (slow)', '#CALC! (slow)']);
+  }
+
+  // the clock: on a page in front, a formula that it stops with the whole budget is kept as too heavy at once; on a
+  // page in the background (slower) it is not, and is computed when the page is in front again
+  const realNow = Date.now;
+  let skew = 0, slowClock = false;
+  Date.now = () => realNow() + (slowClock ? (skew += 300) : skew);
+  const hide = (on) => { if (on) Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); else delete document.hidden; };
+  try {
+    // 399 reads: few steps, but the clock is looked at every 16 of them
+    const clocked = { A1: '=SUM(B2:B400)', C1: '=A1+1' };
+    for (let r = 2; r <= 400; r++) clocked['B' + r] = '1';
+    g = book2(clocked, { rows: 410 });
+    await burst();
+    slowClock = true; const first = shown(g.at('A1')); slowClock = false;
+    await burst();
+    const kept = [shown(g.at('A1')), shown(g.at('C1')), g.eng.keptSlow(g.sh, 0, 0)];
+    g.eng.invalidate();
+    same('budget: stopped by the clock on a page in front', [first, kept, [shown(g.at('A1')), shown(g.at('C1'))]], ['#CALC! (slow)', ['#CALC! (slow)', '#CALC! (slow)', true], [399, 400]]);
+    g = book2(clocked, { rows: 410 });
+    await burst();
+    let hiddenRun;
+    try { hide(true); slowClock = true; hiddenRun = [shown(g.at('A1')), g.eng.keptSlow(g.sh, 0, 0), g.eng.heavyFound()]; } finally { slowClock = false; hide(false); }
+    await burst();
+    same('budget: stopped by the clock on a page in the background', [hiddenRun, shown(g.at('A1')), shown(g.at('C1'))], [['#CALC! (slow)', false, 0], 399, 400]);
+  } finally { Date.now = realNow; }
+  await burst();
+
+  // results that are really empty keep the plain #CALC!
+  g = book2({ A1: '=FILTER({1;2;3},{1;2;3}>5)', A2: '=UNIQUE(FILTER({1;2},{0;0}))', A3: '#CALC!', A4: "'#CALC!" });
+  same('budget: empty results are not the budget #CALC!', ['A1', 'A2', 'A3', 'A4'].map((a) => shown(g.at(a))), ['#CALC!', '#CALC!', '#CALC!', '#CALC!']);
+  same('budget: isSlowCalc of empty results', ['A1', 'A2', 'A3'].map((a) => isSlowCalc(g.at(a))), [false, false, false]);
+
+  // conditional formatting and validation formulas: a formula too heavy is #CALC! and is not computed again
+  g = book2({ A1: '5' });
+  await burst();
+  const cf1 = shown(g.eng.evalAt(HEAVY + '>0', g.sh, 0, 0));
+  await burst();
+  const t0 = performance.now(), cf2 = shown(g.eng.evalAt(HEAVY + '>0', g.sh, 0, 0)), cfMs = performance.now() - t0;
+  same('budget: a heavy evalAt formula', [cf1, cf2, cfMs < 50, g.eng.evalAt('=A1>3', g.sh, 0, 0)], ['#CALC! (slow)', '#CALC! (slow)', true, true]);
+  await burst();
+} catch (e) { results.push({ ok: false, f: 'work budget tests', v: 'threw ' + e.message + ' ' + e.stack, expected: '' }); }
+
+t('regular expressions: case-insensitive classes and flag groups match as JavaScript', () => {
+  // classes without case: "ı" is not "I", and "ς", "µ", "ϑ" and "ǆ" are equal to "σ", "μ", "θ" and "ǅ"
+  eq('=REGEXTEST("ı","[A-Z]",1)', false); eq('=REGEXTEST("ılık","^[A-Za-z]+$",1)', false); eq('=REGEXTEST("I","[a-z]",1)', true);
+  eq('=REGEXEXTRACT("çğıöşü ÇĞİÖŞÜ","[^\\x00-\\x7F]+",0,1)', 'çğıöşü'); eq('=ROWS(REGEXEXTRACT("Σσς","[σ]",1,1))', 3);
+  eq('=REGEXEXTRACT("kısa yol","[\\w]+",0,1)', 'k'); eq('=ROWS(REGEXEXTRACT("kısa yol","[\\w]+",1,1))', 3);
+  eq('=REGEXTEST("\u00B5","[\u03BC]",1)', true); eq('=REGEXTEST("ϑ","[Θ]",1)', true); eq('=REGEXTEST("ǆ","[ǅ]",1)', true);
+  eq('=REGEXTEST("\u212A","[k]",1)', false); eq('=REGEXTEST("\u017F","[s]",1)', false); eq('=REGEXTEST("ABC","[^a-c]",1)', false);
+  // flag groups: (?i:…), (?-i:…), (?s:…), (?m:…)
+  eq('=REGEXTEST("xABC","(?i:abc)")', true); eq('=REGEXEXTRACT("xAbC","x(?i:ab)C")', 'xAbC'); eq('=REGEXTEST("xAbc","x(?i:ab)C")', false);
+  eq('=REGEXTEST("Abc","(?-i:a)bc",1)', false); eq('=REGEXTEST("aBC","(?-i:a)bc",1)', true); eq('=REGEXEXTRACT("ABab","(?i:a(?-i:b))")', 'ab');
+  eq('=REGEXTEST("a"&CHAR(10)&"b","(?s:a.b)")', true); eq('=REGEXTEST("a"&CHAR(10)&"b","a.b")', false);
+  eq('=REGEXEXTRACT("x"&CHAR(10)&"b","(?m:^b)")', 'b'); eq('=REGEXTEST("a"&CHAR(10)&"b","(?m:a$)")', true); eq('=REGEXTEST("a"&CHAR(10)&"b","a$")', false);
+  for (const p of ['(?-:a)', '(?ii:a)', '(?i-i:a)', '(?i)abc', '(?x:a)', '(?i:a', '(?<=a)b', 'a{2,1}', 'a{30000}']) eq('=REGEXTEST("a","' + p + '")', '#VALUE!');
+  // counts over 1000, as long as the pattern stays small enough to run
+  eq('=REGEXTEST(REPT("a",1001),"^a{1001}$")', true); eq('=REGEXTEST(REPT("a",1000),"a{1001}")', false); eq('=REGEXTEST(REPT("a",1200),"^a{1000,}$")', true);
+  eq('=LEN(REGEXEXTRACT(REPT("ab",3000),"^(?:ab){3000}$"))', 6000);
+  quick('(?:){1000000000} costs nothing', () => ev('=REGEXTEST("x","(?:){1000000000}x")') === true);
+  // the same matches as JavaScript
+  const g = book2({ C1: '=REGEXEXTRACT(A1,B1,0,0)', C2: '=REGEXEXTRACT(A1,B1,0,1)' });
+  const jsMatch = (t, p, cs) => { let re; try { re = new RegExp(p, cs ? 'i' : ''); } catch (e) { return '#VALUE!'; } const m = re.exec(t); return m ? m[0] : '#N/A'; };
+  const LS = String.fromCharCode(0x2028), PS = String.fromCharCode(0x2029);
+  const cases = [['xABC', '(?i:abc)'], ['xAbC', 'x(?i:ab)C'], ['ABC', '(?-i:A)bc'], ['Abc', '(?-i:a)bc'], ['a\nb', '(?s:a.b)'], ['a\rb', '(?s:a.b)'],
+    ['x\nb', '(?m:^b)'], ['a' + LS + 'b', '(?m:^b)'], ['a' + PS, '(?m:a$)'], ['A\nB', '(?im:^b$)'], ['aAaA', '(?i:a)+'], ['aAAb', '(?i:a){2}b'],
+    ['AbAB', '(?i-s:ab)'], ['aB', '(?i-:ab)'], ['A\nb', '(?i-m:a$)'], ['ıI', '(?i:[A-Z]+)'], ['Σσς', '(?i:[σ]+)'], ['a\n', '(?m:$)'], ['', '(?m:^$)'],
+    ['çğıöşü ÇĞİÖŞÜ', '[^\\x00-\\x7F]+'], ['kısa yol', '[\\w]+'], ['ǄǅǆΣσς', '[ǅ]+'], ['Straße', '[ß]'], ['ΣΑΣ', '[^σ]'], ['xy', '(){5}x'], ['ab', '(?-:a)']];
+  const bad = [];
+  for (const [t, p] of cases) {
+    g.set('A1', "'" + t); g.set('B1', "'" + p);
+    for (const cs of [0, 1]) { g.eng.invalidate(); const got = shown(g.at(cs ? 'C2' : 'C1')), exp = jsMatch(t, p, cs); if (got !== exp) bad.push([t, p, cs, got, exp]); }
+  }
+  same('regex matches as JavaScript (' + cases.length * 2 + ' cases)', bad, []);
+  // every UTF-16 code unit against JavaScript, for classes without case
+  const h = book2({ C1: '=REGEXREPLACE(A1,B1,"",0,1)' }), classBad = [];
+  for (const cls of ['[A-Z]', '[^a-z]', '[\\w]', '[^\\x00-\\x7F]', '[σ]', '[ǅ]', '[µ]', '[à-ÿ]', '[k]', '(?i:[s])']) {
+    for (let from = 0; from < 0x10000; from += 30000) {
+      let text = '';
+      for (let k = from; k < Math.min(0x10000, from + 30000); k++) text += String.fromCharCode(k);
+      h.set('A1', "'" + text); h.set('B1', "'" + cls);
+      h.eng.invalidate();
+      if (h.at('C1') !== text.replace(new RegExp(cls, 'gi'), '')) classBad.push(cls + ' from ' + from);
+    }
+  }
+  same('regex classes without case match as JavaScript for every code unit', classBad, []);
+});
+t('FACT and FACTDOUBLE take the whole part below the limit', () => {
+  eq('=FACT(170.5)=FACT(170)', true); eq('=FACT(170.9999)=FACT(170)', true); eq('=FACTDOUBLE(300.5)=FACTDOUBLE(300)', true);
+  eq('=FACTDOUBLE(300)', 8.154414069380e307, 1e-9); eq('=FACT(171)', '#NUM!'); eq('=FACTDOUBLE(301)', '#NUM!'); eq('=FACT(-0.5)', '#NUM!');
+  quick('FACT(1E9) is #NUM! at once', () => ev('=FACT(1E9)').code === '#NUM!');
 });
 try {
   const IO = await import('./io.js');

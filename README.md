@@ -26,7 +26,13 @@ app is attached to; collapse and expand it with the section header like other is
   use SUBTOTAL, which leaves out rows hidden by a filter.
 - **Formatting.** Number formats (number, currency, accounting, percent, scientific, date, time, duration, text and
   custom formats such as `#,##0.00 "€"` or `dd.mm.yyyy`), fonts, sizes, bold, italic, underline, strikethrough, text and
-  fill colors, borders, alignment, wrap, merge and format painter. The currency button uses the currency symbol of your locale ($ when the app does not know the locale's currency).
+  fill colors, borders, alignment, wrap, merge and format painter. **Format cells…** (cell context menu or Format menu)
+  sets the number format, alignment, font, borders and fill in one dialog. The currency button uses the currency symbol of your locale ($ when the app does not know the locale's currency).
+- **Several ranges.** Ctrl+click or Ctrl+drag (Cmd on a Mac) adds cells, ranges, rows or columns to the selection, as in
+  Excel. Formatting, Format cells, clearing, hiding, row heights and column widths, merging, fill down and right, and
+  Ctrl+Enter act on all selected ranges, and the status bar totals them. Ranges over the same rows (or the same columns)
+  are copied together as one block, so two columns far apart paste side by side; one copied cell pastes into all
+  selected ranges. Cut, inserting and deleting rows and columns, sorting, filters and AutoSum work on one range at a time.
 - **Conditional formatting.** 30 rule types: values, text, dates, duplicates, top/bottom N, above/below average, custom
   formulas, 2- and 3-color scales, data bars and an arrow icon set.
 - **Data validation.** Dropdown lists (from items, a range or a named range), checkboxes, number, whole-number, date and
@@ -82,7 +88,7 @@ you remove the app.
 
 | Setting (project) | Effect |
 | --- | --- |
-| **Everyone who can see the issue can edit** | Off (default): users with the Update Issue permission can edit; users who can only read the issue can view. On: every user who can see the issue can edit. |
+| **Everyone who can see the issue can edit** | Off (default): users with the Update Issue permission can edit; users who can only read the issue can view. On: every signed-in user who can see the issue can edit (the guest account never edits). |
 | **Groups that can edit spreadsheets** | Members can create and edit spreadsheets in the issues they can see, even without Update Issue. |
 | **Groups that can only view spreadsheets** | Members never edit, even with Update Issue. Overrides the two settings above. |
 
@@ -111,6 +117,7 @@ checks this on every request, and an open spreadsheet switches between editing a
 | Ctrl+Enter | Fill the selection with what you typed |
 | Esc | Cancel editing |
 | Arrows, Ctrl+arrows, Shift+… | Move, jump to the edge of the data, extend the selection |
+| Ctrl+click, Ctrl+drag (Cmd on a Mac) | Add cells, a range, rows or columns to the selection |
 | Ctrl+C / X / V, Ctrl+Shift+V | Copy, cut, paste, paste values |
 | Ctrl+Z / Ctrl+Y | Undo, redo |
 | Ctrl+B / I / U / 5 | Bold, italic, underline, strikethrough |

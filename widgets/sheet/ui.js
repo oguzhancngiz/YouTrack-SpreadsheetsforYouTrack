@@ -102,7 +102,31 @@ const P = {
   calendar: '<rect x="2.5" y="3.5" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3"/>',
   pick: '<rect x="2.5" y="2.5" width="8" height="8" rx="1" stroke-dasharray="2 1.6"/><path d="M8.5 8.5 13.5 10.5 11.3 11.3 10.5 13.5z"/>',
   solver: '<path d="M2.5 13.5h11M2.5 13.5V2.5"/><path d="M4.5 11 7 7.5l2.5 2L13 4"/><circle cx="13" cy="4" r="1.2" fill="currentColor"/>',
-  whatif: '<path d="M6 6a2 2 0 1 1 2.8 1.8c-.5.3-.8.7-.8 1.2v.5"/><path d="M8 12h.01"/><circle cx="8" cy="8" r="5.5"/>'
+  whatif: '<path d="M6 6a2 2 0 1 1 2.8 1.8c-.5.3-.8.7-.8 1.2v.5"/><path d="M8 12h.01"/><circle cx="8" cy="8" r="5.5"/>',
+  // clipboard and cell menus
+  cut: '<circle cx="4.5" cy="11.5" r="2"/><circle cx="11.5" cy="11.5" r="2"/><path d="M5.8 10 12.5 2.5M10.2 10 3.5 2.5"/>',
+  copy: '<rect x="5.5" y="5.5" width="8" height="8" rx="1.2"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>',
+  paste: '<rect x="5.5" y="1.5" width="5" height="3" rx="1"/><path d="M10.5 3h1.5a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h1.5"/>',
+  pasteSpecial: '<rect x="5.5" y="1.5" width="5" height="3" rx="1"/><path d="M10.5 3h1.5a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h1.5"/><path d="M5.5 8h5M5.5 11h3"/>',
+  values: '<path d="M6.5 2.5 5 13.5M11 2.5 9.5 13.5M3 6h10M2.5 10h10"/>',
+  transpose: '<rect x="2.5" y="2.5" width="8" height="3" rx="1"/><rect x="10.5" y="5.5" width="3" height="8" rx="1"/><path d="M4.5 7.5v2.5a2 2 0 0 0 2 2H8"/><path d="m6.8 10.4 1.6 1.6-1.6 1.6"/>',
+  insert: '<rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M8 5.5v5M5.5 8h5"/>',
+  remove: '<rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M5.5 8h5"/>',
+  rowAbove: '<rect x="2.5" y="8.5" width="11" height="5" rx="1"/><path d="M8 1.5v5M5.5 4h5"/>',
+  rowBelow: '<rect x="2.5" y="2.5" width="11" height="5" rx="1"/><path d="M8 9.5v5M5.5 12h5"/>',
+  colLeft: '<rect x="8.5" y="2.5" width="5" height="11" rx="1"/><path d="M4 5.5v5M1.5 8h5"/>',
+  colRight: '<rect x="2.5" y="2.5" width="5" height="11" rx="1"/><path d="M12 5.5v5M9.5 8h5"/>',
+  delRow: '<rect x="2.5" y="5.5" width="11" height="5" rx="1"/><path d="m6.5 6.5 3 3m0-3-3 3"/>',
+  delCol: '<rect x="5.5" y="2.5" width="5" height="11" rx="1"/><path d="m6.5 6.5 3 3m0-3-3 3"/>',
+  eyeOff: '<path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/><path d="m2.5 2.5 11 11"/>',
+  rowHeight: '<path d="M2.5 2.5h11M2.5 13.5h11M8 5v6M6 7l2-2 2 2M6 9l2 2 2-2"/>',
+  colWidth: '<path d="M2.5 2.5v11M13.5 2.5v11M5 8h6M7 6 5 8l2 2M9 6l2 2-2 2"/>',
+  fitCols: '<path d="M2.5 2.5v11M13.5 2.5v11M5 6h6M5 10h4"/>',
+  fitRows: '<path d="M2.5 2.5h11M2.5 13.5h11M6 5v6M10 5v4"/>',
+  clearContents: '<path d="M5.5 3.5H13a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5.5L1.8 8z"/><path d="m7.5 6 4 4m0-4-4 4"/>',
+  formatCells: '<rect x="2.5" y="2.5" width="8" height="8" rx="1"/><path d="M2.5 6.5h8M6.5 2.5v8"/><path d="m9 14 .3-1.8 4-4 1.5 1.5-4 4z"/>',
+  validation: '<path d="M13.5 7.5v-4a1 1 0 0 0-1-1h-9a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1H7"/><path d="M2.5 6h11"/><path d="m9 11.8 2 2 3.5-4"/>',
+  tag: '<path d="M2.5 3.5v4l6 6 5-5-6-6h-4a1 1 0 0 0-1 1z"/><circle cx="5.5" cy="5.5" r="1"/>'
 };
 export function icon(name, size = 16) {
   return `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
@@ -268,7 +292,7 @@ export function menu(items, anchorRect, opts = {}) {
   const el = h('div', { class: 'menu', role: 'menu' });
   // the check and icon columns only take room when an item uses them
   if (list.some((it) => isItem(it) && it.checked !== undefined)) el.classList.add('has-check');
-  if (list.some((it) => isItem(it) && (it.icon || it.swatch))) el.classList.add('has-icon');
+  if (list.some((it) => isItem(it) && (it.icon || hexColor(it.swatch)))) el.classList.add('has-icon');
   if (opts.minWidth) el.style.minWidth = Math.ceil(opts.minWidth) + 'px';
   let subOpen = null;
   const buttons = [];
@@ -276,9 +300,11 @@ export function menu(items, anchorRect, opts = {}) {
   list.forEach((it) => {
     if (it === '-') { el.appendChild(h('div', { class: 'menu-sep', role: 'separator' })); return; }
     if (it.header) { el.appendChild(h('div', { class: 'menu-header' }, it.header)); return; }
+    // swatches can be stored data (the tab colors in All sheets): only a #rrggbb color reaches the style
+    const swatch = hexColor(it.swatch);
     const b = h('button', { class: 'menu-item' + (it.danger ? ' danger' : ''), role: it.checked !== undefined ? 'menuitemcheckbox' : 'menuitem', 'aria-checked': it.checked !== undefined ? String(!!it.checked) : null, type: 'button', disabled: it.disabled ? true : null },
       h('span', { class: 'mi-check', html: it.checked ? icon('check', 14) : '' }),
-      h('span', { class: 'mi-icon', html: it.icon ? icon(it.icon, 16) : (it.swatch ? `<span class="swatch" style="background:${esc(it.swatch)}"></span>` : '') }),
+      h('span', { class: 'mi-icon', html: it.icon ? icon(it.icon, 16) : (swatch ? `<span class="swatch" style="background:${esc(swatch)}"></span>` : '') }),
       h('span', { class: 'mi-label' }, it.label),
       h('span', { class: 'mi-kbd' }, it.kbd || ''),
       it.sub ? h('span', { class: 'mi-sub', html: icon('chevron', 12) }) : null);
@@ -535,7 +561,7 @@ export function colorPicker(anchorRect, current, onPick, resetLabel = 'Automatic
     class: 'sw' + (current === c ? ' on' : ''), type: 'button', title: c, 'aria-label': c, style: { background: c },
     onclick: () => { closePopups(); onPick(c); }
   })));
-  const custom = h('input', { type: 'color', value: current || '#3369d6', 'aria-label': 'Custom color' });
+  const custom = h('input', { type: 'color', value: hexColor(current) || '#3369d6', 'aria-label': 'Custom color' });
   custom.addEventListener('change', () => { closePopups(); onPick(custom.value.toLowerCase()); });
   const content = h('div', { class: 'color-pop' },
     h('button', { class: 'btn small', type: 'button', onclick: () => { closePopups(); onPick(null); } }, resetLabel),
@@ -545,9 +571,11 @@ export function colorPicker(anchorRect, current, onPick, resetLabel = 'Automatic
 }
 
 const HEX = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i;
+/** The color when it is #rrggbb, otherwise null. Colors in a workbook are data: nothing else may reach a style. */
+export const hexColor = (c) => (typeof c === 'string' && HEX.test(c) ? c : null);
 /** Relative luminance (WCAG) of a #rrggbb color, or null for anything else. */
 export function luminance(hex) {
-  const m = HEX.exec(hex || '');
+  const m = typeof hex === 'string' ? HEX.exec(hex) : null;
   if (!m) return null;
   const [r, g, b] = [m[1], m[2], m[3]].map((x) => parseInt(x, 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -582,11 +610,12 @@ function hslHex(hue, s, l) {
   return '#' + [r, g, b].map((v) => Math.round(Math.min(1, Math.max(0, v + m)) * 255).toString(16).padStart(2, '0')).join('');
 }
 function cachedHsl(kind, hex, fn) {
+  if (!hexColor(hex)) return null; // anything else is never passed on to a style
   const key = kind + hex.toLowerCase();
   let v = hslCache.get(key);
   if (v === undefined) {
     if (hslCache.size > 2000) hslCache.clear();
-    v = HEX.test(hex) ? fn(...toHsl(hex)) : hex;
+    v = fn(...toHsl(hex));
     hslCache.set(key, v);
   }
   return v;
@@ -599,31 +628,33 @@ export function liftText(hex) { return cachedHsl('t', hex, (hue, s, l) => hslHex
 /**
  * Classes and inline declarations for a fill and a text color that people picked (#rrggbb, stored for the light theme):
  * class f with --cbg (and --cbg-d, a darker fill for the dark theme), class c with --cfc (and --cfc-d, a lighter text).
- * app.css draws them for cells and for the rule previews of conditional formatting. Returns { cls, parts }.
+ * app.css draws them for cells and for the rule previews of conditional formatting. Any other value counts as no color.
+ * Returns { cls, parts }.
  */
 export function themedColors(bg, fc) {
   const parts = [];
   let cls = '';
-  const fill = bg && HEX.test(bg) ? bg : null;
+  const fill = hexColor(bg), text = hexColor(fc);
   if (fill) {
     cls += ' f';
     parts.push('--cbg:' + fill);
     if (luminance(fill) > 0.4) parts.push('--cbg-d:' + darkFill(fill));
   }
-  if (fc && HEX.test(fc)) {
+  if (text) {
     cls += ' c';
-    parts.push('--cfc:' + fc);
-    if (luminance(fc) < 0.25) parts.push('--cfc-d:' + liftText(fc));
-  } else if (!fc && fill && luminance(fill) <= 0.4) parts.push('color:' + contrastText(fill)); // mid and dark fills keep their color in both themes
+    parts.push('--cfc:' + text);
+    if (luminance(text) < 0.25) parts.push('--cfc-d:' + liftText(text));
+  } else if (fill && luminance(fill) <= 0.4) parts.push('color:' + contrastText(fill)); // mid and dark fills keep their color in both themes
   return { cls, parts };
 }
 
 /** The current color as the bar under a button's label (a .cbar child). Dark text colors show lighter in the dark theme,
  * as they do in the cells. */
 export function paintBar(btn, color, isText) {
-  btn.style.setProperty('--cur', color || (isText ? 'var(--text)' : 'transparent'));
-  const L = isText && color ? luminance(color) : null;
-  if (L !== null && L < 0.25) btn.style.setProperty('--cur-d', liftText(color));
+  const c = hexColor(color); // the color of a cell or a rule is stored data: anything but #rrggbb counts as none
+  btn.style.setProperty('--cur', c || (isText ? 'var(--text)' : 'transparent'));
+  const L = isText && c ? luminance(c) : null;
+  if (L !== null && L < 0.25) btn.style.setProperty('--cur-d', liftText(c));
   else btn.style.removeProperty('--cur-d');
 }
 
@@ -648,5 +679,5 @@ export function relTime(iso, locale) {
     if (s < 86400) return rtf.format(-Math.round(s / 3600), 'hour');
     if (s < 86400 * 7) return rtf.format(-Math.round(s / 86400), 'day');
   } catch (e) { /* ignore */ }
-  try { return new Intl.DateTimeFormat(locale || 'en', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso)); } catch (e) { return iso.slice(0, 16).replace('T', ' '); }
+  try { return new Intl.DateTimeFormat(locale || 'en', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso)); } catch (e) { return String(iso).slice(0, 16).replace('T', ' '); }
 }

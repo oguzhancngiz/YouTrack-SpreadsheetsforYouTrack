@@ -18,7 +18,7 @@
  * (see sheet-core.js) and never changes the workbook directly. */
 import {
   shiftFormula, translateFormula, renameSheetInFormula, rewriteRefs, parseInput, formatValue, isErr, compare,
-  colName, literal, numToText, serialToParts, dateToSerial, parseRefText, parseFormula
+  colName, literal, numToText, serialToParts, dateToSerial, parseRefText, parseFormula, budgetSpent, isSlowCalc, charge, cellIndependent
 } from './formula.js';
 
 const Core = window.SheetCore;
@@ -182,32 +182,70 @@ function escHtml(s) {
 }
 function tsvCell(s) { return /[\t\n"]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
 
-/** Copies a rectangle: text for other apps, HTML table for Excel and Google Sheets, and an internal copy. */
+/**
+ * Copies a rectangle: text for other apps, HTML table for Excel and Google Sheets, and an internal copy.
+ * Values the formula work budget left out are never copied as if they were values: when values read in this pass may
+ * be missing, it returns { pending: true } and keeps the earlier copy (the caller computes them for the next try). A
+ * formula that needs more calculation than the spreadsheet does at once (#CALC!, isSlowCalc) is copied without its
+ * value, and the result says so with slow: true.
+ */
 export function copyRect(engine, sheet, rect, locale, cut) {
-  const rows = [], text = [], html = [];
-  for (let r = rect.r1; r <= rect.r2; r++) {
-    if (sheet.hr && sheet.hr[sheet.rows[r]] && rect.r2 > rect.r1) continue;
+  return copyCells(engine, sheet, span(rect.r1, rect.r2), span(rect.c1, rect.c2), locale, cut);
+}
+const span = (a, b) => Array.from({ length: Math.max(0, b - a + 1) }, (_, i) => a + i);
+/**
+ * The rows and columns that a copy of several selected ranges takes, as in Excel: ranges over the same rows are copied
+ * side by side (their columns in sheet order), ranges over the same columns one above the other (their rows in sheet
+ * order). A cell in more than one of them is copied once. null when the ranges are neither.
+ */
+export function copyLines(rects) {
+  const a = rects[0];
+  const union = (list) => [...new Set(list)].sort((x, y) => x - y);
+  if (rects.every((x) => x.r1 === a.r1 && x.r2 === a.r2)) return { rows: span(a.r1, a.r2), cols: union(rects.flatMap((x) => span(x.c1, x.c2))) };
+  if (rects.every((x) => x.c1 === a.c1 && x.c2 === a.c2)) return { rows: union(rects.flatMap((x) => span(x.r1, x.r2))), cols: span(a.c1, a.c2) };
+  return null;
+}
+/**
+ * Copies the cells where the rows cross the columns (sorted lists of row and column numbers): a rectangle, or several
+ * ranges copied together (copyLines), which are then pasted as one block. Hidden rows are left out when more than one
+ * row is copied. The internal copy keeps the row and column each copied cell came from (src.rows, src.cols): a pasted
+ * formula moves by the distance from its own cell, and Values only reads that cell.
+ */
+export function copyCells(engine, sheet, lines, cols, locale, cut) {
+  const rows = [], text = [], html = [], srcRows = [];
+  let slow = false;
+  for (const r of lines) {
+    if (budgetSpent()) return { pending: true };
+    if (sheet.hr && sheet.hr[sheet.rows[r]] && lines.length > 1) continue;
+    srcRows.push(r);
     const row = [], trow = [], hrow = [];
-    for (let c = rect.c1; c <= rect.c2; c++) {
+    for (const c of cols) {
       const cell = cellAt(sheet, r, c);
       row.push(cell ? { v: cell.v, st: cell.st, n: cell.n } : null);
-      const shown = formatValue(engine.valueAt(sheet, r, c), cell && cell.st, locale);
+      const v = engine.valueAt(sheet, r, c);
+      if (isSlowCalc(v)) slow = true;
+      const shown = isSlowCalc(v) ? '' : formatValue(v, cell && cell.st, locale);
       trow.push(tsvCell(shown));
       const st = cell && cell.st ? cell.st : {};
+      // checked values only (#rrggbb colors, known alignments), and the attribute is escaped as well
+      const fc = typeof st.fc === 'string' && HEX.test(st.fc) ? st.fc : null, bg = typeof st.bg === 'string' && HEX.test(st.bg) ? st.bg : null;
+      const ha = ['left', 'center', 'right'].includes(st.ha) ? st.ha : null;
       const css = [st.b ? 'font-weight:bold' : '', st.i ? 'font-style:italic' : '', st.u ? 'text-decoration:underline' : '',
-        st.fc ? 'color:' + st.fc : '', st.bg ? 'background:' + st.bg : '', st.ha ? 'text-align:' + st.ha : ''].filter(Boolean).join(';');
-      hrow.push(`<td${css ? ` style="${css}"` : ''}>${escHtml(shown)}</td>`);
+        fc ? 'color:' + fc : '', bg ? 'background:' + bg : '', ha ? 'text-align:' + ha : ''].filter(Boolean).join(';');
+      hrow.push(`<td${css ? ` style="${escHtml(css)}"` : ''}>${escHtml(shown)}</td>`);
     }
     rows.push(row);
     text.push(trow.join('\t'));
     html.push('<tr>' + hrow.join('') + '</tr>');
   }
+  if (budgetSpent()) return { pending: true };
   const token = Math.random().toString(36).slice(2);
-  internalClip = { token, rows, src: { sheetId: sheet.id, r1: rect.r1, c1: rect.c1 }, cut: !!cut, rect: { ...rect } };
+  internalClip = { token, rows, src: { sheetId: sheet.id, r1: lines[0], c1: cols[0], rows: srcRows, cols: cols.slice() }, cut: !!cut };
   return {
     text: text.join('\r\n'),
     html: `<table ${CLIP_MARK}="${token}"><tbody>${html.join('')}</tbody></table>`,
-    clip: internalClip
+    clip: internalClip,
+    slow
   };
 }
 export function clearInternalClip() { internalClip = null; }
@@ -242,7 +280,11 @@ function colorToHex(c) {
   return null;
 }
 
-/** Parses clipboard HTML. Returns { ours: clip } for our own copy, { rows: [[{text, st}]] } for a table, or null. */
+/**
+ * Parses clipboard HTML. Returns { ours: clip } for our own copy, { rows: [[{text, st}]] } for a table,
+ * { tooBig: true } for a table larger than one batch of changes, or null. DOMParser builds an inert document:
+ * nothing in the pasted markup runs or loads.
+ */
 export function parseClipboardHtml(html) {
   if (!html) return null;
   const m = new RegExp(CLIP_MARK + '="([a-z0-9]+)"').exec(html);
@@ -250,13 +292,20 @@ export function parseClipboardHtml(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const table = doc.querySelector('table');
   if (!table) return null;
+  const L = Core.LIMITS;
+  // every cell, including the ones under row and column spans, counts against one batch of changes
+  let budget = L.opsPerBatch, tooBig = false;
   const out = [];
   const spans = [];
   table.querySelectorAll('tr').forEach((tr, ri) => {
+    if (tooBig) return;
+    if (ri >= L.rows) { tooBig = true; return; }
     const row = out[ri] || (out[ri] = []);
     let ci = 0;
     tr.querySelectorAll('td,th').forEach((td) => {
+      if (tooBig) return;
       while (row[ci] !== undefined) ci++;
+      if (ci >= L.cols) { tooBig = true; return; }
       const style = td.getAttribute('style') || '';
       const get = (prop) => { const mm = new RegExp('(?:^|;)\\s*' + prop + '\\s*:\\s*([^;]+)', 'i').exec(style); return mm ? mm[1] : null; };
       const st = {};
@@ -273,7 +322,10 @@ export function parseClipboardHtml(html) {
       if (ta && ['left', 'center', 'right'].includes(ta.trim())) st.ha = ta.trim();
       let text = td.innerText !== undefined && td.innerText !== '' ? td.innerText : td.textContent;
       text = text.replace(/ /g, ' ').replace(/\n$/, '');
-      const rs = +td.getAttribute('rowspan') || 1, cs = +td.getAttribute('colspan') || 1;
+      // whole numbers of at least 1 that fit in the sheet (attributes are text: NaN, negative and huge values are clamped)
+      const span = (name, max) => { const n = Math.floor(Number(td.getAttribute(name))); return n > 1 ? Math.min(n, max) : 1; };
+      const rs = span('rowspan', L.rows - ri), cs = span('colspan', L.cols - ci);
+      if ((budget -= rs * cs) < 0) { tooBig = true; return; }
       row[ci] = { text, st: Object.keys(st).length ? st : null };
       if (rs > 1 || cs > 1) spans.push({ r1: ri, c1: ci, r2: ri + rs - 1, c2: ci + cs - 1 });
       for (let a = 0; a < rs; a++) for (let b = 0; b < cs; b++) {
@@ -284,8 +336,11 @@ export function parseClipboardHtml(html) {
       ci += cs;
     });
   });
-  const w = Math.max(0, ...out.map((r) => r.length));
-  return { rows: out.map((r) => Array.from({ length: w }, (_, i) => r[i] || { text: '', st: null })), spans };
+  if (tooBig) return { tooBig: true };
+  let w = 0;
+  for (const r of out) if (r && r.length > w) w = r.length;
+  if (out.length * w > L.opsPerBatch) return { tooBig: true };
+  return { rows: Array.from(out, (r) => Array.from({ length: w }, (_, i) => (r && r[i]) || { text: '', st: null })), spans };
 }
 
 /** Ops that grow the sheet so that rows/cols up to (r, c) exist. */
@@ -300,6 +355,8 @@ export function growOps(sheet, r, c) {
  * Paste. `data` is our clip ({rows: [[{v, st, n}]], src}) or external ({rows: [[{text, st}]]}).
  * mode: 'all' | 'values' | 'formats' | 'formulas'; transpose: boolean.
  * When the target selection is larger than the copied block and a multiple of it, the block is repeated.
+ * Returns null when it is more than one batch of changes can hold, and false when values of copied formulas are not
+ * computed (the formula work budget left them out): they are never pasted as if they were values.
  */
 export function pasteOps(engine, doc, sheet, target, data, opts) {
   const { mode = 'all', transpose = false, locale } = opts || {};
@@ -309,11 +366,18 @@ export function pasteOps(engine, doc, sheet, target, data, opts) {
   if (!h || !w) return [];
   const th = target.r2 - target.r1 + 1, tw = target.c2 - target.c1 + 1;
   const reps = th % h === 0 && tw % w === 0 && (th > h || tw > w) ? [th / h, tw / w] : [1, 1];
+  // more cells than one batch of changes can hold: the caller says so instead of trying
+  if (h * w * reps[0] * reps[1] > Core.LIMITS.opsPerBatch) return null;
   const ops = growOps(sheet, target.r1 + h * reps[0] - 1, target.c1 + w * reps[1] - 1);
   // grow a scratch copy so keys exist
   const rowIds = sheet.rows.slice(), colIds = sheet.cols.slice();
   for (const op of ops) { if (op.t === 'rows') rowIds.push(...op.add); if (op.t === 'cols') colIds.push(...op.add); }
   const ext = !!data.rows[0][0] && 'text' in (data.rows[0][0] || {});
+  // the row and column a copied cell came from (copies of several ranges, and copies that left hidden rows out, are
+  // not one rectangle of the sheet)
+  const srcR = (i) => (data.src && Array.isArray(data.src.rows) ? data.src.rows[i] : data.src.r1 + i);
+  const srcC = (j) => (data.src && Array.isArray(data.src.cols) ? data.src.cols[j] : data.src.c1 + j);
+  let read = false, unknown = false;
   for (let a = 0; a < reps[0]; a++) for (let b = 0; b < reps[1]; b++) {
     for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) {
       const r = target.r1 + a * h + i, c = target.c1 + b * w + j;
@@ -331,12 +395,14 @@ export function pasteOps(engine, doc, sheet, target, data, opts) {
           let v = src ? src.v ?? null : null;
           if (typeof v === 'string' && v[0] === '=') {
             if (mode === 'values') {
-              const sr = data.src.r1 + (transpose ? j : i), sc = data.src.c1 + (transpose ? i : j);
+              const sr = srcR(transpose ? j : i), sc = srcC(transpose ? i : j);
               const srcSheet = doc.sheets.find((s) => s.id === data.src.sheetId);
               const val = srcSheet ? engine.valueAt(srcSheet, sr, sc) : null;
+              read = true;
+              if (isSlowCalc(val)) unknown = true;
               v = val === null || isErr(val) ? (isErr(val) ? val.code : null) : typeof val === 'number' ? numToText(val) : typeof val === 'boolean' ? (val ? 'TRUE' : 'FALSE') : String(val).match(/^[=+'-]/) ? "'" + val : String(val);
             } else {
-              const dr = r - (data.src.r1 + (transpose ? j : i)), dc = c - (data.src.c1 + (transpose ? i : j));
+              const dr = r - srcR(transpose ? j : i), dc = c - srcC(transpose ? i : j);
               v = translateFormula(v, dr, dc);
             }
           }
@@ -348,6 +414,8 @@ export function pasteOps(engine, doc, sheet, target, data, opts) {
       ops.push(op);
     }
   }
+  // values read after the work budget ran out may be wrong without showing #CALC!
+  if (unknown || (read && budgetSpent())) return false;
   return ops;
 }
 function mergeFmt(st, fmt) {
@@ -358,11 +426,14 @@ function mergeFmt(st, fmt) {
 /** Ops that clear the source of a cut (cells that the paste didn't overwrite). */
 export function cutClearOps(doc, clip, targetSheetId, target) {
   const sheet = doc.sheets.find((s) => s.id === clip.src.sheetId);
-  if (!sheet) return [];
+  if (!sheet || !clip.rows.length) return [];
   const ops = [];
   const h = clip.rows.length, w = clip.rows[0].length;
+  // the cells that were copied (rows hidden at the time were left out of the copy, and stay)
+  const srcR = (i) => (Array.isArray(clip.src.rows) ? clip.src.rows[i] : clip.src.r1 + i);
+  const srcC = (j) => (Array.isArray(clip.src.cols) ? clip.src.cols[j] : clip.src.c1 + j);
   for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) {
-    const r = clip.src.r1 + i, c = clip.src.c1 + j;
+    const r = srcR(i), c = srcC(j);
     if (sheet.id === targetSheetId && r >= target.r1 && r < target.r1 + h && c >= target.c1 && c < target.c1 + w) continue;
     if (!sheet.rows[r] || !sheet.cols[c]) continue;
     const k = keyAt(sheet, r, c);
@@ -461,14 +532,22 @@ export function fillOps(sheet, src, dest, dir, copyOnly) {
 
 /* ---------------------------------------------------------------- sort, dedupe */
 
-/** keys: [{ c: column index, desc }] */
+/* Sort and dedupe never decide on values that the formula work budget left out (#CALC!, isSlowCalc) or that were read
+ * after it ran out (they may be wrong without showing it): they give null, and the caller computes the values first
+ * (app.js computeValues) or says why nothing was done. */
+
+/** keys: [{ c: column index, desc }]. Null when sort keys are not computed. */
 export function sortOps(engine, sheet, rect, keys, hasHeader) {
   const top = rect.r1 + (hasHeader ? 1 : 0);
   if (top > rect.r2) return [];
   const rows = [];
+  let unknown = false;
   for (let r = top; r <= rect.r2; r++) {
-    rows.push({ r, cells: Array.from({ length: rect.c2 - rect.c1 + 1 }, (_, j) => cellAt(sheet, r, rect.c1 + j)), vals: keys.map((k) => engine.valueAt(sheet, r, k.c)) });
+    const vals = keys.map((k) => engine.valueAt(sheet, r, k.c));
+    if (vals.some(isSlowCalc)) unknown = true;
+    rows.push({ r, cells: Array.from({ length: rect.c2 - rect.c1 + 1 }, (_, j) => cellAt(sheet, r, rect.c1 + j)), vals });
   }
+  if (unknown || budgetSpent()) return null;
   rows.sort((a, b) => {
     for (let i = 0; i < keys.length; i++) {
       const x = a.vals[i], y = b.vals[i];
@@ -494,17 +573,23 @@ export function sortOps(engine, sheet, rect, keys, hasHeader) {
   return ops;
 }
 
+/** { ops, removed }, or null when the compared values are not computed. */
 export function dedupeOps(engine, sheet, rect, cols, hasHeader) {
   const top = rect.r1 + (hasHeader ? 1 : 0);
   const seen = new Set();
   const keep = [];
-  let removed = 0;
+  let removed = 0, unknown = false;
   for (let r = top; r <= rect.r2; r++) {
-    const key = JSON.stringify(cols.map((c) => { const v = engine.valueAt(sheet, r, c); return typeof v === 'string' ? v.toLowerCase() : isErr(v) ? v.code : v; }));
+    const key = JSON.stringify(cols.map((c) => {
+      const v = engine.valueAt(sheet, r, c);
+      if (isSlowCalc(v)) unknown = true;
+      return typeof v === 'string' ? v.toLowerCase() : isErr(v) ? v.code : v;
+    }));
     if (seen.has(key)) { removed++; continue; }
     seen.add(key);
     keep.push(r);
   }
+  if (unknown || budgetSpent()) return null;
   const ops = [];
   keep.forEach((src, i) => {
     const r = top + i;
@@ -584,25 +669,38 @@ export function tableAt(engine, sheet, r, c, version, locale) {
 /** Display text used by filters for a value. */
 export const filterText = (v, st, locale) => (v === null || v === '' ? '' : formatValue(v, st, locale));
 
-/** Row indexes hidden by table filters. */
+/**
+ * Row indexes hidden by table filters. A value that is not computed (the formula work budget left it out, or it was
+ * read in the step that ran out) is unknown: its row stays visible. The widget works the filters out again once the
+ * values are computed.
+ */
 export function filteredRows(engine, sheet, version, locale) {
   const hidden = new Set();
   const ix = indexOf(sheet, version);
   for (const t of sheet.tables || []) {
     const f = t.filters;
-    if (!f || !Object.keys(f).length) continue;
+    if (!f || typeof f !== 'object' || !Object.keys(f).length) continue;
     const rect = objRect(t, ix);
     if (!rect) continue;
     const top = rect.r1 + (t.header !== false ? 1 : 0), bottom = rect.r2 - (t.totals ? 1 : 0);
-    for (const colId in f) {
+    for (const colId of Object.keys(f)) {
       const c = ix.cols.get(colId);
       if (c === undefined) continue;
       const spec = f[colId];
-      const allowed = spec.vals ? new Set(spec.vals) : null;
+      // stored data: a filter that is not in the shape the app writes is ignored instead of breaking the sheet
+      if (!spec || typeof spec !== 'object') continue;
+      const allowed = Array.isArray(spec.vals) ? new Set(spec.vals) : null;
       for (let r = top; r <= bottom; r++) {
         if (hidden.has(r)) continue;
         const cell = cellAt(sheet, r, c);
+        const was = budgetSpent();
         const v = engine.valueAt(sheet, r, c);
+        if (isSlowCalc(v) || (!was && budgetSpent())) {
+          // not known: the row stays shown, and formulas that ask whether it is hidden are not computed either (app.js
+          // rowHidden). Read after the budget ran out, the whole result is computed again later (app.js filteredFor).
+          (hidden.unknown || (hidden.unknown = new Set())).add(r);
+          continue;
+        }
         if (allowed && !allowed.has(filterText(v, cell && cell.st, locale))) { hidden.add(r); continue; }
         if (spec.cond && !condMatch(spec.cond, v, filterText(v, cell && cell.st, locale))) hidden.add(r);
       }
@@ -644,15 +742,30 @@ export const CF_TYPES = {
 function ruleStats(engine, sheet, rect, cache, id) {
   if (cache.has(id)) return cache.get(id);
   const nums = [], counts = new Map();
-  for (let r = rect.r1; r <= rect.r2; r++) for (let c = rect.c1; c <= rect.c2; c++) {
-    const v = engine.valueAt(sheet, r, c);
-    if (typeof v === 'number') nums.push(v);
-    if (v !== null && v !== '') { const k = typeof v === 'string' ? v.toLowerCase() : isErr(v) ? v.code : String(v); counts.set(k, (counts.get(k) || 0) + 1); }
+  let cut = false;
+  try {
+    for (let r = rect.r1; r <= rect.r2; r++) {
+      // every cell read counts against the formula work budget, so that rules over huge ranges cannot freeze the page
+      charge(rect.c2 - rect.c1 + 1);
+      for (let c = rect.c1; c <= rect.c2; c++) {
+        const v = engine.valueAt(sheet, r, c);
+        if (typeof v === 'number') nums.push(v);
+        if (v !== null && v !== '') { const k = typeof v === 'string' ? v.toLowerCase() : isErr(v) ? v.code : String(v); counts.set(k, (counts.get(k) || 0) + 1); }
+      }
+    }
+  } catch (e) {
+    if (!isSlowCalc(e)) throw e;
+    cut = true;
   }
+  // the budget ran out (in charge, or in a value read last): no statistics yet (the rule is not drawn), the next
+  // redraw reads them again
+  if (cut || budgetSpent()) return null;
   const sorted = nums.slice().sort((a, b) => a - b);
   const stats = { min: sorted[0], max: sorted[sorted.length - 1], avg: nums.length ? nums.reduce((s, x) => s + x, 0) / nums.length : 0, sorted, counts };
   stats.mid = sorted.length ? (sorted.length % 2 ? sorted[sorted.length >> 1] : (sorted[(sorted.length >> 1) - 1] + sorted[sorted.length >> 1]) / 2) : 0;
+  // kept statistics count as progress, so that the widget draws again for the rules after them (app.js continueCalc)
   cache.set(id, stats);
+  engine.noteProgress();
   return stats;
 }
 function mix(c1, c2, t) {
@@ -660,23 +773,62 @@ function mix(c1, c2, t) {
   const a = p(c1), b = p(c2);
   return '#' + a.map((x, i) => Math.round(x + (b[i] - x) * t).toString(16).padStart(2, '0')).join('');
 }
-function cfNumber(engine, sheet, x, r, c) {
-  if (typeof x === 'string' && x[0] === '=') return engine.evalAt(x, sheet, r, c);
+/* The group of a conditional formatting rule's formula for Engine.evalAt: one name for all the cells of the rule (the
+ * formula text, translated for each cell, is not repeated in the engine's keys). Each rule object gets its own. */
+const ruleGroups = new WeakMap();
+let ruleGroupSeq = 0;
+function ruleGroup(rule, part) {
+  let g = ruleGroups.get(rule);
+  if (!g) { g = 'cf' + (++ruleGroupSeq); ruleGroups.set(rule, g); }
+  return g + part;
+}
+/** A number of a rule: as written, or the value of its formula (group: see ruleGroup; none for validation). */
+function cfNumber(engine, sheet, x, r, c, group) {
+  if (typeof x === 'string' && x[0] === '=') return engine.evalAt(x, sheet, r, c, group, !!group && cellIndependent(x, engine.book.names));
   const n = Number(String(x).replace(',', '.'));
   return x === '' || x === undefined || isNaN(n) ? x : n;
 }
 
-/** Conditional formatting result for a cell: { bg, fc, b, i, x, bar: {pct, color, neg}, icon }. */
+const HEX = /^#[0-9a-f]{6}$/i;
+/** A #rrggbb color from a rule, or null: rules are stored data, so only checked colors leave this function. */
+const ruleColor = (c) => (typeof c === 'string' && HEX.test(c) ? c : null);
+
+/**
+ * Conditional formatting result for a cell: { bg, fc, b, i, x, bar: {pct, color, neg}, icon }. Colors in the result
+ * are always #rrggbb. A rule that cannot be evaluated (malformed stored data) is skipped instead of breaking the grid.
+ */
 export function cfFor(engine, sheet, r, c, ix, cache) {
   let out = null;
   for (const rule of sheet.cf || []) {
+    if (!rule || typeof rule.type !== 'string' || !Object.prototype.hasOwnProperty.call(CF_TYPES, rule.type)) continue;
     const rect = objRect(rule, ix);
     if (!inRect(rect, r, c)) continue;
+    let res;
+    try { res = cfRule(engine, sheet, rule, rect, r, c, cache); } catch (e) { res = null; }
+    if (!res) continue;
+    out = out || {};
+    if (rule.style && typeof rule.style === 'object') {
+      for (const k of ['bg', 'fc']) { const col = ruleColor(rule.style[k]); if (col && out[k] === undefined) out[k] = col; }
+      for (const k of ['b', 'i', 'x']) if (rule.style[k] && out[k] === undefined) out[k] = 1;
+    }
+    for (const k in res.extra) if (out[k] === undefined) out[k] = res.extra[k];
+    if (rule.stop === true) break;
+  }
+  return out;
+}
+
+/** Whether one rule applies to the cell: null, or { extra } with the rule's own fill, data bar or icon. */
+function cfRule(engine, sheet, rule, rect, r, c, cache) {
+  if (rule.id === undefined || rule.id === null) return null;
+  {
     const v = engine.valueAt(sheet, r, c);
     const text = v === null ? '' : isErr(v) ? v.code : typeof v === 'string' ? v : String(v);
     let hit = false;
     const extra = {};
-    const A = () => cfNumber(engine, sheet, rule.a, r, c), B = () => cfNumber(engine, sheet, rule.b, r, c);
+    // a threshold that is not computed (the work budget's #CALC!) applies to nothing: compare() orders errors above every
+    // number, so 'lt' would hit every cell. Thrown, it makes cfFor skip the rule for the cell.
+    const known = (x) => { if (isSlowCalc(x)) throw x; return x; };
+    const A = () => known(cfNumber(engine, sheet, rule.a, r, c, ruleGroup(rule, 'a'))), B = () => known(cfNumber(engine, sheet, rule.b, r, c, ruleGroup(rule, 'b')));
     switch (rule.type) {
       case 'gt': hit = v !== null && compare(v, A()) > 0; break;
       case 'lt': hit = v !== null && compare(v, A()) < 0; break;
@@ -699,6 +851,7 @@ export function cfFor(engine, sheet, r, c, ix, cache) {
       case 'dup': case 'unique': {
         if (text === '') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
+        if (!s) break;
         const n = s.counts.get(typeof v === 'string' ? v.toLowerCase() : isErr(v) ? v.code : String(v)) || 0;
         hit = rule.type === 'dup' ? n > 1 : n === 1;
         break;
@@ -706,6 +859,7 @@ export function cfFor(engine, sheet, r, c, ix, cache) {
       case 'top': case 'bottom': {
         if (typeof v !== 'number') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
+        if (!s) break;
         let n = Math.max(1, Number(rule.a) || 10);
         if (rule.pct) n = Math.max(1, Math.floor(s.sorted.length * n / 100));
         const lim = rule.type === 'top' ? s.sorted[Math.max(0, s.sorted.length - n)] : s.sorted[Math.min(s.sorted.length - 1, n - 1)];
@@ -715,6 +869,7 @@ export function cfFor(engine, sheet, r, c, ix, cache) {
       case 'aboveAvg': case 'belowAvg': {
         if (typeof v !== 'number') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
+        if (!s) break;
         hit = rule.type === 'aboveAvg' ? v > s.avg : v < s.avg;
         break;
       }
@@ -729,34 +884,46 @@ export function cfFor(engine, sheet, r, c, ix, cache) {
         break;
       }
       case 'formula': {
-        if (!rule.formula) break;
-        // relative references are relative to the top-left cell of the range, as in Excel
-        const f = translateFormula(rule.formula[0] === '=' ? rule.formula : '=' + rule.formula, r - rect.r1, c - rect.c1);
-        const res = engine.evalAt(f, sheet, r, c);
+        if (typeof rule.formula !== 'string' || !rule.formula) break;
+        const g = ruleGroup(rule, 'f');
+        let res = engine.keptAt(sheet, r, c, g);
+        if (res === undefined) {
+          // relative references are relative to the top-left cell of the range, as in Excel. Translating a long formula
+          // for each drawn cell takes time too, so it counts against the work budget (once the result is kept, not)
+          const src = rule.formula[0] === '=' ? rule.formula : '=' + rule.formula;
+          charge(1 + (src.length >> 6));
+          res = engine.evalAt(translateFormula(src, r - rect.r1, c - rect.c1), sheet, r, c, g, cellIndependent(src, engine.book.names));
+        }
         hit = res === true || (typeof res === 'number' && res !== 0);
         break;
       }
       case 'scale2': case 'scale3': {
         if (typeof v !== 'number') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
-        const cols = rule.colors || (rule.type === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a']);
+        if (!s) break;
+        // the rule's own colors only when they are all #rrggbb and as many as the scale needs
+        const def = rule.type === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a'];
+        const cols = Array.isArray(rule.colors) && rule.colors.length === def.length && rule.colors.every(ruleColor) ? rule.colors : def;
         if (s.max === s.min) { extra.bg = cols[cols.length - 1]; hit = true; break; }
         if (rule.type === 'scale2') extra.bg = mix(cols[0], cols[1], (v - s.min) / (s.max - s.min));
         else extra.bg = v <= s.mid ? mix(cols[0], cols[1], s.mid === s.min ? 1 : (v - s.min) / (s.mid - s.min)) : mix(cols[1], cols[2], s.max === s.mid ? 1 : (v - s.mid) / (s.max - s.mid));
+        if (!ruleColor(extra.bg)) delete extra.bg;
         hit = true;
         break;
       }
       case 'bar': {
         if (typeof v !== 'number') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
+        if (!s) break;
         const lo = Math.min(0, s.min), hi = Math.max(0, s.max);
-        extra.bar = { pct: hi === lo ? 100 : Math.abs(v) / (hi - lo) * 100, color: rule.color || '#3369d6', neg: v < 0, zero: hi === lo ? 0 : -lo / (hi - lo) * 100 };
+        extra.bar = { pct: hi === lo ? 100 : Math.abs(v) / (hi - lo) * 100, color: ruleColor(rule.color) || '#3369d6', neg: v < 0, zero: hi === lo ? 0 : -lo / (hi - lo) * 100 };
         hit = true;
         break;
       }
       case 'icons': {
         if (typeof v !== 'number') break;
         const s = ruleStats(engine, sheet, rect, cache, rule.id);
+        if (!s) break;
         const t = s.max === s.min ? 1 : (v - s.min) / (s.max - s.min);
         extra.icon = t >= 0.67 ? 'up' : t >= 0.33 ? 'side' : 'down';
         hit = true;
@@ -764,13 +931,8 @@ export function cfFor(engine, sheet, r, c, ix, cache) {
       }
       default: break;
     }
-    if (!hit) continue;
-    out = out || {};
-    if (rule.style) for (const k of ['bg', 'fc', 'b', 'i', 'x']) if (rule.style[k] && out[k] === undefined) out[k] = rule.style[k];
-    for (const k in extra) if (out[k] === undefined) out[k] = extra[k];
-    if (rule.stop) break;
+    return hit ? { extra } : null;
   }
-  return out;
 }
 
 /* ---------------------------------------------------------------- data validation */
@@ -784,25 +946,31 @@ export function dvFor(sheet, r, c, ix) {
 }
 
 /** Items of a list rule: "a, b, c" or a range ("=$A$1:$A$10", "=Lists!A:A"). */
-export function listItems(engine, doc, sheet, rule, locale) {
+export function listItems(engine, doc, sheet, rule, locale, names = new Set()) {
   const src = String(rule.source || '');
   if (src[0] === '=') {
     const rect = parseRect(src.slice(1));
     if (!rect) {
-      // a defined name
-      const def = doc.names && doc.names[src.slice(1).toUpperCase()];
-      return def ? listItems(engine, doc, sheet, { source: def[0] === '=' ? def : '=' + def }, locale) : [];
+      // a defined name; names can point at other names, so a cycle (or a very long chain) ends with no items
+      const key = src.slice(1).toUpperCase();
+      if (names.has(key) || names.size >= 16) return [];
+      names.add(key);
+      const def = doc.names && Object.prototype.hasOwnProperty.call(doc.names, key) ? doc.names[key] : null;
+      return typeof def === 'string' && def ? listItems(engine, doc, sheet, { source: def[0] === '=' ? def : '=' + def }, locale, names) : [];
     }
     const sh = rect.sheet ? doc.sheets.find((s) => s.name.toLowerCase() === rect.sheet.toLowerCase()) : sheet;
     if (!sh) return [];
     const out = [], seen = new Set();
     for (let r = rect.r1; r <= Math.min(rect.r2, sh.rows.length - 1); r++) for (let c = rect.c1; c <= Math.min(rect.c2, sh.cols.length - 1); c++) {
       const v = engine.valueAt(sh, r, c);
+      // a value the formula work budget left out is no item: the list is then marked incomplete
+      if (isSlowCalc(v)) { out.incomplete = true; continue; }
       if (v === null || v === '') continue;
       const cell = cellAt(sh, r, c);
       const t = formatValue(v, cell && cell.st, locale);
       if (!seen.has(t)) { seen.add(t); out.push(t); }
     }
+    if (budgetSpent()) out.incomplete = true;
     return out;
   }
   return src.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
@@ -826,7 +994,10 @@ export function validate(engine, doc, sheet, r, c, rule, parsed, locale) {
   switch (rule.type) {
     case 'list': {
       if (parsed.kind === 'formula') return null;
-      const items = listItems(engine, doc, sheet, rule, locale).map((x) => x.toLowerCase());
+      const list = listItems(engine, doc, sheet, rule, locale);
+      // items that are not computed (the work budget) are unknown: no value is rejected for lack of them
+      if (list.incomplete) return null;
+      const items = list.map((x) => x.toLowerCase());
       const text = String(parsed.raw).replace(/^'/, '');
       const shown = parsed.num !== undefined ? formatValue(parsed.num, parsed.fmt, locale).toLowerCase() : text.toLowerCase();
       return items.includes(text.toLowerCase()) || items.includes(shown) ? null : msg || 'Choose a value from the list.';
@@ -871,16 +1042,56 @@ export function styleOps(sheet, rect, patch, opts = {}) {
   return ops;
 }
 
+/**
+ * Style ops for several rectangles (the ranges of a selection) as one change: patchFor(rect) is the patch of each
+ * rectangle (an object, or a function of the cell's style, row, column and whether an earlier rectangle of this change
+ * already styled the cell). A cell in more than one of them gets one op, made from what the earlier rectangles left (a
+ * border around each of two overlapping ranges keeps both).
+ */
+export function styleOpsMulti(sheet, rects, patchFor, opts = {}) {
+  const next = new Map(); // cell key → its style after the rectangles so far
+  for (const rect of rects) {
+    const patch = patchFor(rect);
+    for (let r = rect.r1; r <= rect.r2; r++) {
+      if (opts.skipHidden && sheet.hr[sheet.rows[r]]) continue;
+      for (let c = rect.c1; c <= rect.c2; c++) {
+        const k = keyAt(sheet, r, c);
+        const cell = sheet.cells[k];
+        const again = next.has(k);
+        const before = again ? next.get(k) : (cell && cell.st ? cell.st : null);
+        const st = { ...(before || {}) };
+        const p = typeof patch === 'function' ? patch(st, r, c, again) : patch;
+        for (const key in p) { if (p[key] === null || p[key] === undefined || p[key] === false) delete st[key]; else st[key] = p[key]; }
+        next.set(k, Object.keys(st).length ? st : null);
+      }
+    }
+  }
+  const ops = [];
+  for (const [k, st] of next) {
+    const cell = sheet.cells[k];
+    if (JSON.stringify(st) !== JSON.stringify(cell && cell.st ? cell.st : null)) ops.push({ t: 'set', s: sheet.id, k, st });
+  }
+  return ops;
+}
+
 /** Border ops: mode 'all' | 'outer' | 'inner' | 'top' | 'bottom' | 'left' | 'right' | 'none' | 'thick'. */
 export function borderOps(sheet, rect, mode, color) {
-  return styleOps(sheet, rect, (st, r, c) => {
+  return styleOps(sheet, rect, borderPatch(rect, mode, color));
+}
+/**
+ * The style patch of a border mode for the cells of a rectangle (see borderOps). again: an earlier rectangle of the
+ * same change already gave the cell its borders (several selected ranges, styleOpsMulti), which a thick outline keeps.
+ */
+export function borderPatch(rect, mode, color) {
+  return (st, r, c, again) => {
     let sides = mode === 'none' ? '' : (st.bd || '');
     const add = (s) => { if (!sides.toLowerCase().includes(s)) sides += s; };
+    const thick = (s) => { sides = sides.replace(s, '').replace(s.toUpperCase(), '') + s.toUpperCase(); };
     const top = r === rect.r1, bottom = r === rect.r2, left = c === rect.c1, right = c === rect.c2;
     switch (mode) {
       case 'all': sides = 'tlrb'; break;
       case 'outer': if (top) add('t'); if (bottom) add('b'); if (left) add('l'); if (right) add('r'); break;
-      case 'thick': sides = sides.replace(/[tlrbTLRB]/g, ''); if (top) sides += 'T'; if (bottom) sides += 'B'; if (left) sides += 'L'; if (right) sides += 'R'; break;
+      case 'thick': if (!again) sides = ''; if (top) thick('t'); if (bottom) thick('b'); if (left) thick('l'); if (right) thick('r'); break;
       case 'inner': if (!bottom) add('b'); if (!right) add('r'); break;
       case 'top': if (top) add('t'); break;
       case 'bottom': if (bottom) add('b'); break;
@@ -889,7 +1100,7 @@ export function borderOps(sheet, rect, mode, color) {
       default: break;
     }
     return { bd: sides || null, bc: sides && color ? color : (sides ? st.bc : null) };
-  });
+  };
 }
 
 /** Rewrites references to a defined name or text in formulas (used by Find & Replace in formulas). */

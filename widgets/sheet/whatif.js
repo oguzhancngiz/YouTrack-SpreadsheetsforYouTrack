@@ -23,7 +23,7 @@
  */
 import { h, icon, dialog, confirmDialog, promptDialog, field, select, checkbox, toast } from './ui.js';
 import * as M from './model.js';
-import { Engine, colName, numToText, isErr, quoteSheet, formulaSyntaxError, formatValue, literal, parseInput, localeInfo, rewriteRefs } from './formula.js';
+import { Engine, colName, numToText, isErr, quoteSheet, formulaSyntaxError, formatValue, literal, parseInput, localeInfo, rewriteRefs, budgetSpent } from './formula.js';
 import * as SV from './solver.js';
 
 const Core = window.SheetCore;
@@ -40,6 +40,8 @@ const BIG = 1e30;
 
 const isFormula = (raw) => typeof raw === 'string' && raw[0] === '=';
 const strip = (t) => String(t || '').trim().replace(/^=/, '').trim();
+/** k is one of the keys of a fixed map such as OP_TEXT (stored values like "constructor" are not). */
+const isKey = (map, k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(map, k);
 /** Numeric value of a cell for Solver: blank = 0, TRUE/FALSE = 1/0, text and errors are not numbers. */
 const num = (v) => {
   if (typeof v === 'number') return v;
@@ -107,6 +109,8 @@ function cellsOf(a) {
   for (let r = a.r1; r <= a.r2; r++) for (let c = a.c1; c <= a.c2; c++) out.push([r, c]);
   return out;
 }
+/** Number of cells of an area, without listing them (stored references may name huge ranges). */
+const sizeOf = (a) => (a.r2 - a.r1 + 1) * (a.c2 - a.c1 + 1);
 /** Report label of a cell: the nearest text to its left and above it, as Excel does. */
 function labelOf(engine, sheet, r, c) {
   const textAt = (rr, cc) => { const v = engine.valueAt(sheet, rr, cc); return typeof v === 'string' && v.trim() ? v.trim() : null; };
@@ -118,11 +122,12 @@ function labelOf(engine, sheet, r, c) {
 function parseNumber(text, locale) {
   const t = String(text ?? '').trim().replace(/\u2212/g, '-');
   if (!t) return null;
-  // the exact form editNum writes: digits, the locale's decimal separator, an optional exponent
+  // the exact form editNum writes: digits, the locale's decimal separator, an optional exponent (written so that the
+  // regex cannot backtrack between two runs of digits)
   const dec = localeInfo(locale).dec;
   if (dec === '.' || !t.includes('.')) {
     const canon = dec === '.' ? t : t.replace(dec, '.');
-    if (/^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(canon)) return +canon;
+    if (/^[-+]?(\d+(\.\d*)?|\.\d+)(e[-+]?\d+)?$/i.test(canon)) return +canon;
   }
   const p = parseInput(t, locale);
   if (p.num !== undefined && isFinite(p.num)) return p.num;
@@ -157,11 +162,15 @@ function snapshot(A) {
     tableAt: (s, r, c) => M.tableAt(se, s, r, c, ver, A.LOCALE),
     rowHidden(s, r) {
       if (s.hr && s.hr[s.rows[r]]) return 'manual';
-      if (!filtered.has(s.id)) {
+      let rows = filtered.get(s.id);
+      if (!rows) {
         const live = sheetById(A, s.id);
-        filtered.set(s.id, live ? M.filteredRows(A.engine, live, A.version(), A.LOCALE) : new Set());
+        rows = live ? M.filteredRows(A.engine, live, A.version(), A.LOCALE) : new Set();
+        // computed while the work budget was used up: not kept, so that it is worked out again
+        if (!budgetSpent()) filtered.set(s.id, rows);
       }
-      return filtered.get(s.id).has(r) ? 'filter' : null;
+      // 'unknown': the filter's value in the row is not known (see app.js rowHidden)
+      return rows.has(r) ? 'filter' : rows.unknown && rows.unknown.has(r) ? 'unknown' : null;
     }
   };
   se = new Engine(book, A.LOCALE);
@@ -206,14 +215,14 @@ function normModel(o) {
     goal: ['max', 'min', 'value'].includes(o.goal) ? o.goal : 'max',
     value: typeof o.value === 'string' ? o.value : '0',
     vars: Array.isArray(o.vars) ? o.vars.filter((v) => typeof v === 'string') : [],
-    cons: Array.isArray(o.cons) ? o.cons.filter((c) => c && typeof c.l === 'string' && OP_TEXT[c.op]).map((c) => ({ l: c.l, op: c.op, r: typeof c.r === 'string' ? c.r : '' })) : [],
+    cons: Array.isArray(o.cons) ? o.cons.filter((c) => c && typeof c.l === 'string' && isKey(OP_TEXT, c.op)).map((c) => ({ l: c.l, op: c.op, r: typeof c.r === 'string' ? c.r : '' })) : [],
     nonneg: o.nonneg !== false,
-    method: METHODS[o.method] ? o.method : 'grg',
+    method: isKey(METHODS, o.method) ? o.method : 'grg',
     opts: cleanOptions(o.opts)
   };
 }
 export function modelOf(sheet) {
-  const o = (sheet && sheet.solver || []).find((x) => x.id === MODEL_ID);
+  const o = (sheet && Array.isArray(sheet.solver) ? sheet.solver : []).find((x) => x && x.id === MODEL_ID);
   return o ? normModel(o) : null;
 }
 function saveModel(A, sheetId, m) {
@@ -238,7 +247,7 @@ function mergeModel(A, sheetId, orig, edited) {
   for (const f of MODEL_FIELDS) out[f] = JSON.stringify(e[f]) !== JSON.stringify(o[f]) ? e[f] : cur[f];
   return normModel(out);
 }
-const NUM_RE = /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i;
+const NUM_RE = /^[-+]?(\d+(\.\d*)?|\.\d+)(e[-+]?\d+)?$/i; // no backtracking between two runs of digits
 /** Right side for display and editing: stored numbers ("=2.125") in the user's locale ("2,125" in Turkish), with all
  * their digits; anything else as is. */
 function rhsText(r, locale) {
@@ -267,6 +276,16 @@ function buildProblem(A, sheetId, model) {
     return a;
   };
   const rawAt = (s, r, c) => se.raw(s, r, c);
+  // a label is looked up once per cell: the lookup reads the row to the left and the column above the cell
+  const labels = new Map();
+  const labelAt = (r, c) => {
+    const k = r + '|' + c;
+    let v = labels.get(k);
+    if (v === undefined) { v = labelOf(se, ssh, r, c); labels.set(k, v); }
+    return v;
+  };
+  const tooManyVars = `${SV.MESSAGES.tooLarge} Solver can change at most ${MAX_VARS} variable cells.`;
+  const tooManyRows = `${SV.MESSAGES.tooLarge} At most ${MAX_ROWS} constraint cells are supported.`;
 
   // objective
   let obj = null;
@@ -274,7 +293,7 @@ function buildProblem(A, sheetId, model) {
     const a = areaOf(model.obj, 'Objective');
     if (a.sheet !== ssh || a.r1 !== a.r2 || a.c1 !== a.c2) fail('The Objective must be a single cell on this sheet.');
     if (!isFormula(rawAt(ssh, a.r1, a.c1))) fail('The Objective cell must contain a formula.');
-    obj = { r: a.r1, c: a.c1, addr: addr(ssh, a.r1, a.c1), name: labelOf(se, ssh, a.r1, a.c1) };
+    obj = { r: a.r1, c: a.c1, addr: addr(ssh, a.r1, a.c1), name: labelAt(a.r1, a.c1) };
   }
   let target = null;
   if (model.goal === 'value') {
@@ -289,14 +308,15 @@ function buildProblem(A, sheetId, model) {
   for (const text of model.vars) {
     const a = areaOf(text, 'Variable cells');
     if (a.sheet !== ssh) fail('Variable cells must be on this sheet.');
+    if (sizeOf(a) > MAX_VARS) fail(tooManyVars); // before the cells are listed: a stored model may name a huge range
     for (const [r, c] of cellsOf(a)) {
       const k = r + '|' + c;
       if (varIndex.has(k)) continue;
       if (isFormula(rawAt(ssh, r, c))) fail(`Variable cells must contain values, not formulas (${addr(ssh, r, c)}).`);
       const v = se.valueAt(ssh, r, c);
       varIndex.set(k, vars.length);
-      vars.push({ r, c, key: M.keyAt(ssh, r, c), addr: addr(ssh, r, c), name: labelOf(se, ssh, r, c), orig: v, start: isFinite(num(v)) ? num(v) : 0 });
-      if (vars.length > MAX_VARS) fail(`${SV.MESSAGES.tooLarge} Solver can change at most ${MAX_VARS} variable cells.`);
+      vars.push({ r, c, key: M.keyAt(ssh, r, c), addr: addr(ssh, r, c), name: labelAt(r, c), orig: v, start: isFinite(num(v)) ? num(v) : 0 });
+      if (vars.length > MAX_VARS) fail(tooManyVars);
     }
   }
   if (!vars.length) fail('Enter the variable cells in "By Changing Variable Cells".');
@@ -310,14 +330,19 @@ function buildProblem(A, sheetId, model) {
   model.cons.forEach((con, ci) => {
     const L = areaOf(con.l, 'Constraint');
     if (L.sheet !== ssh) fail('Constraint cells must be on this sheet.');
+    // sizes are checked before the cells are listed (a stored model may name a huge range): integer, binary and
+    // AllDifferent constraints take only variable cells, any other constraint gives a row for each other cell
+    const onlyVars = `"${strip(con.l)}": integer, binary and AllDifferent constraints can only be set on variable cells.`;
+    if (OP_WORD[con.op] && sizeOf(L) > n) fail(onlyVars);
+    if (sizeOf(L) > MAX_ROWS + n) fail(tooManyRows);
     const cells = cellsOf(L);
     if (OP_WORD[con.op]) {
       const js = cells.map(([r, c]) => varIndex.get(r + '|' + c));
-      if (js.some((j) => j === undefined)) fail(`"${strip(con.l)}": integer, binary and AllDifferent constraints can only be set on variable cells.`);
+      if (js.some((j) => j === undefined)) fail(onlyVars);
       if (con.op === 'dif') {
         difGroups.push(js);
         js.forEach((j) => { isInt[j] = true; intKind[j] = 'AllDiff'; implicitLb[j] = Math.max(implicitLb[j], 1); implicitUb[j] = Math.min(implicitUb[j], js.length); implicitLower[j] = true; });
-        listed.push({ kind: 'dif', con: ci, addr: areaText(L), name: labelOf(se, ssh, L.r1, L.c1), js, formula: areaText(L) + '=AllDifferent' });
+        listed.push({ kind: 'dif', con: ci, addr: areaText(L), name: labelAt(L.r1, L.c1), js, formula: areaText(L) + '=AllDifferent' });
       } else {
         js.forEach((j, i) => {
           isInt[j] = true;
@@ -336,8 +361,8 @@ function buildProblem(A, sheetId, model) {
     if (!isNum) R = resolveArea(se, doc.names, rtext, ssh);
     let rhsAt;
     if (R) {
+      if (sizeOf(R) !== 1 && sizeOf(R) !== cells.length) fail(`"${consText(con, A.LOCALE)}": the right side must be a number, a formula, a single cell or a range of the same size as the left side.`);
       const rc = cellsOf(R);
-      if (rc.length !== 1 && rc.length !== cells.length) fail(`"${consText(con, A.LOCALE)}": the right side must be a number, a formula, a single cell or a range of the same size as the left side.`);
       rhsAt = (i) => {
         const [r, c] = rc.length === 1 ? rc[0] : rc[i];
         return { get: () => num(se.valueAt(R.sheet, r, c)), cell: [R.sheet, r, c], text: addr(R.sheet, r, c, ssh) };
@@ -352,7 +377,7 @@ function buildProblem(A, sheetId, model) {
       const rh = rhsAt(i);
       const j = varIndex.get(r + '|' + c);
       const lhsGet = () => num(se.valueAt(ssh, r, c));
-      const entry = { kind: 'row', con: ci, rel: con.op, addr: addr(ssh, r, c), name: labelOf(se, ssh, r, c), formula: addr(ssh, r, c) + OP_TEXT[con.op] + rh.text, lhsGet, rhsGet: rh.get, r, c };
+      const entry = { kind: 'row', con: ci, rel: con.op, addr: addr(ssh, r, c), name: labelAt(r, c), formula: addr(ssh, r, c) + OP_TEXT[con.op] + rh.text, lhsGet, rhsGet: rh.get, r, c };
       // a bound: a variable cell compared with a number or with a constant cell that is not a variable
       let constVal = null;
       if (j !== undefined) {
@@ -370,11 +395,11 @@ function buildProblem(A, sheetId, model) {
       } else {
         entry.row = rows.length;
         rows.push(entry);
+        if (rows.length > MAX_ROWS) fail(tooManyRows); // stops at the first constraint that goes over the limit
       }
       listed.push(entry);
     });
   });
-  if (rows.length > MAX_ROWS) fail(`${SV.MESSAGES.tooLarge} At most ${MAX_ROWS} constraint cells are supported.`);
 
   /** Bounds of the variables from implicit bounds (binary, AllDifferent), the given bound constraints and the
    * non-negativity option. */
@@ -760,6 +785,27 @@ function splitComparison(t) {
   }
   return null;
 }
+/**
+ * "<head>X<mid>X<tail>" → X, or null: the same as a regex with a backreference and the i flag, such as
+ * /^=AND\(INT\((.+)\)=\1\)$/i. The length of the text fixes X, so this takes linear time where such a regex can take
+ * quadratic time on long cell text.
+ */
+function twice(t, head, mid, tail) {
+  const g = (t.length - head.length - mid.length - tail.length) / 2;
+  if (!(g >= 1) || g % 1) return null;
+  // case folding as in a regex with the i flag: one UTF-16 unit at a time, never from non-ASCII to ASCII
+  const fold = (s) => {
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i], up = ch.toUpperCase();
+      out += up.length === 1 && !(ch.charCodeAt(0) >= 128 && up.charCodeAt(0) < 128) ? up : ch;
+    }
+    return out;
+  };
+  const x = t.slice(head.length, head.length + g);
+  if (/[\n\r\u2028\u2029]/.test(x) || fold(t.slice(0, head.length)) !== fold(head) || fold(t.slice(head.length + g)) !== fold(mid + x + tail)) return null;
+  return x;
+}
 function parseModelCells(texts) {
   const m = defaultModel();
   const fail = (msg) => { throw new InputError(msg); };
@@ -780,17 +826,18 @@ function parseModelCells(texts) {
     if (/^Solver options:/i.test(t)) {
       t.replace(/^Solver options:/i, '').split(';').forEach((kv) => {
         const [k, v] = kv.split('=').map((s) => s.trim());
-        if (k === 'method' && METHODS[v]) m.method = v;
+        if (k === 'method' && isKey(METHODS, v)) m.method = v;
         else if (k === 'nonneg') m.nonneg = v !== '0';
         else if (k === 'derivatives') m.opts.derivatives = v === 'central' ? 'central' : 'forward';
-        else if (k in SV.DEFAULT_OPTIONS) m.opts[k] = typeof SV.DEFAULT_OPTIONS[k] === 'boolean' ? v === '1' || /^true$/i.test(v) : (isFinite(+v) ? +v : SV.DEFAULT_OPTIONS[k]);
+        else if (isKey(SV.DEFAULT_OPTIONS, k)) m.opts[k] = typeof SV.DEFAULT_OPTIONS[k] === 'boolean' ? v === '1' || /^true$/i.test(v) : (isFinite(+v) ? +v : SV.DEFAULT_OPTIONS[k]);
       });
       break;
     }
     if (!t) break;
-    if ((mm = /^=AND\(INT\((.+)\)=\1\)$/i.exec(t))) m.cons.push({ l: '=' + mm[1], op: 'int', r: '' });
-    else if ((mm = /^=AND\(\((.+)=0\)\+\(\1=1\)\)$/i.exec(t))) m.cons.push({ l: '=' + mm[1], op: 'bin', r: '' });
-    else if ((mm = /^=AND\(SORT\(TOCOL\((.+)\)\)=SEQUENCE\(COUNT\(\1\)\)\)$/i.exec(t))) m.cons.push({ l: '=' + mm[1], op: 'dif', r: '' });
+    let l;
+    if ((l = twice(t, '=AND(INT(', ')=', ')')) !== null) m.cons.push({ l: '=' + l, op: 'int', r: '' });
+    else if ((l = twice(t, '=AND((', '=0)+(', '=1))')) !== null) m.cons.push({ l: '=' + l, op: 'bin', r: '' });
+    else if ((l = twice(t, '=AND(SORT(TOCOL(', '))=SEQUENCE(COUNT(', ')))')) !== null) m.cons.push({ l: '=' + l, op: 'dif', r: '' });
     else {
       let inner = t.replace(/^=/, '');
       if ((mm = /^AND\((.+)\)$/i.exec(inner))) inner = mm[1];
@@ -1246,7 +1293,20 @@ async function findConflict(ctx, opts, withBounds) {
 
 /* ================================================================ scenarios */
 
-function scenariosOf(sheet) { return (sheet && sheet.scenarios || []).slice(); }
+/**
+ * The scenarios of a sheet. They are stored data: a sheet has at most Core.LIMITS.objects of them, names and comments
+ * are text, and a scenario changes at most 32 cells (as in Excel), each with a value that is text, a number or a truth
+ * value; anything else counts as absent.
+ */
+function scenariosOf(sheet) {
+  return (sheet && Array.isArray(sheet.scenarios) ? sheet.scenarios : []).filter((s) => s && typeof s === 'object').slice(0, Core.LIMITS.objects).map((s) => ({
+    ...s,
+    name: typeof s.name === 'string' ? s.name : '',
+    comment: typeof s.comment === 'string' ? s.comment : undefined,
+    cells: (Array.isArray(s.cells) ? s.cells.slice(0, 32) : []).map((t) => (typeof t === 'string' ? t : '')),
+    values: (Array.isArray(s.values) ? s.values.slice(0, 32) : []).map((v) => (v !== null && typeof v === 'object' ? null : v))
+  }));
+}
 
 async function saveScenarioFrom(A, ctx, x) {
   const sh = sheetById(A, ctx.sheetId);
@@ -1348,10 +1408,12 @@ function scenarioEdit(A, sheetId, scn, onDone) {
         const a = resolveArea(A.engine, A.view().names, part, sh);
         if (!a) { toast(`"${part}" is not a valid reference.`, 'error'); return false; }
         if (a.sheet.id !== sheetId) { toast('Changing cells must be on this sheet.', 'error'); return false; }
+        // counted before the cells are listed and after each range: the field may hold a huge stored range
+        if (sizeOf(a) > 32) { toast('A scenario can change at most 32 cells.', 'error'); return false; }
         for (const [r, c] of cellsOf(a)) if (!cells.some((x) => x.r === r && x.c === c)) cells.push({ r, c, addr: addr(sh, r, c) });
+        if (cells.length > 32) { toast('A scenario can change at most 32 cells.', 'error'); return false; }
       }
       if (!cells.length) { toast('Enter the changing cells.', 'error'); return false; }
-      if (cells.length > 32) { toast('A scenario can change at most 32 cells.', 'error'); return false; }
       if (cells.some((c) => isFormula(A.engine.raw(sh, c.r, c.c))) &&
         !(await confirmDialog('Add scenario', 'One or more changing cells contain a formula. Showing the scenario replaces these formulas with values.', 'OK'))) return false;
       const prev = scn ? Object.fromEntries(scn.cells.map((t, i) => [strip(t), scn.values[i]])) : {};
@@ -1425,9 +1487,10 @@ function scenarioSummary(A, sheetId, onDone) {
       for (const part of splitList(resF.input.value)) {
         const a = resolveArea(A.engine, A.view().names, part, sh);
         if (!a) { toast(`"${part}" is not a valid reference.`, 'error'); return false; }
+        // counted before the cells are listed: a huge range is refused without listing it
+        if (results.length + sizeOf(a) > 500) { toast('Choose at most 500 result cells.', 'error'); return false; }
         for (const [r, c] of cellsOf(a)) results.push({ sheet: a.sheet, r, c, addr: addr(a.sheet, r, c, sh) });
       }
-      if (results.length > 500) { toast('Choose at most 500 result cells.', 'error'); return false; }
       const sheetOp = summarySheet(A, sh, results);
       if (A.commit([sheetOp], { label: 'Scenario summary' })) { A.goToSheet(sheetOp.sheet.id); if (onDone) setTimeout(onDone, 0); }
     } }

@@ -26,7 +26,7 @@
 import {
   Engine, parseInput, formatValue, editText, isErr, colName, parseAddr, addrName, formulaRefs, tokenize, translateFormula,
   FUNCTION_NAMES, FUNCTION_HELP, formulaSyntaxError, numToText, literal, localeInfo, quoteSheet, parseFormula, defaultCurrency,
-  separatorStyle, formulaToLocal, formulaFromLocal, helpToLocal
+  separatorStyle, formulaToLocal, formulaFromLocal, helpToLocal, budgetSpent, isSlowCalc
 } from './formula.js';
 import { Store } from './sync.js';
 import * as M from './model.js';
@@ -57,6 +57,8 @@ LOCALE = String(LOCALE || navigator.language || 'en-US').replace(/_/g, '-');
 try { Intl.getCanonicalLocales(LOCALE); } catch (e) { LOCALE = navigator.language || 'en-US'; } // a code the browser does not know
 const MODE = document.body.classList.contains('mode-window') ? 'window' : 'inline';
 const CURRENCY = defaultCurrency(LOCALE);
+// on a Mac, Cmd+click adds to the selection and Ctrl+click is a right-click (it opens the context menu)
+const IS_MAC = /Mac|iPhone|iPad|iPod/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '');
 
 /** Native controls follow the YouTrack theme (Ring UI variables), not the OS theme. */
 function syncColorScheme() {
@@ -114,6 +116,7 @@ const $ = (id) => document.getElementById(id);
 const S = {
   sheetId: null,
   sels: {},              // sheet id → selection
+  // the selected range with the active cell (r, c); more: the ranges selected before it with Ctrl+click (selRects)
   sel: { r: 0, c: 0, r1: 0, c1: 0, r2: 0, c2: 0 },
   editing: null,         // { sheetId, r, c, text, mode: 'enter'|'edit', from: 'cell'|'bar' }
   undo: [], redo: [],
@@ -175,15 +178,21 @@ const book = {
   get names() { return store.view ? store.view.names : {}; },
   findTable: (name) => (store.view ? M.findTable(engine, store.view, name, S.version, LOCALE) : null),
   tableAt: (sh, r, c) => M.tableAt(engine, sh, r, c, S.version, LOCALE),
-  /** 'manual' (hidden row), 'filter' (hidden by a table filter) or null; used by SUBTOTAL and AGGREGATE */
+  /** 'manual' (hidden row), 'filter' (hidden by a table filter), 'unknown' (the filter's value in the row is too heavy
+   * to compute) or null; used by SUBTOTAL and AGGREGATE */
   rowHidden(sh, r) {
     if (sh.hr && sh.hr[sh.rows[r]]) return 'manual';
-    return filteredFor(sh).has(r) ? 'filter' : null;
+    const rows = filteredFor(sh);
+    return rows.has(r) ? 'filter' : rows.unknown && rows.unknown.has(r) ? 'unknown' : null;
   }
 };
 const filterCache = new Map(); // sheet id -> { version, rows }
 let filtering = false;
-/** Rows hidden by table filters, computed once per change. */
+/**
+ * Rows hidden by table filters, computed once per change. Values read after the formula work budget ran out may be
+ * missing (their rows stay visible): such a result is marked partial and not kept, and continueCalc's next round works
+ * it out again with the values computed so far.
+ */
 function filteredFor(sh) {
   const hit = filterCache.get(sh.id);
   if (hit && hit.version === S.version) return hit.rows;
@@ -191,7 +200,8 @@ function filteredFor(sh) {
   filtering = true;
   try {
     const rows = M.filteredRows(engine, sh, S.version, LOCALE);
-    filterCache.set(sh.id, { version: S.version, rows });
+    if (budgetSpent()) rows.partial = true;
+    else filterCache.set(sh.id, { version: S.version, rows });
     return rows;
   } finally { filtering = false; }
 }
@@ -210,8 +220,12 @@ export const A = {
   S, store, engine, LOCALE, api, fmlLocal, fmlStored, fnHelp,
   view, sheet, ix, canEdit,
   commit, render: () => renderAll(), renderGrid: () => renderGrid(), selectRect, selRect, focusGrid,
+  selRects: () => selRects(), selLines: (axis) => selLines(axis), curStyle: () => curStyle(), formatCells: (patch, border) => formatCells(patch, border),
+  currencies: () => [...new Set([CURRENCY, '$', '€', '£', '₺', '¥'])],
   scrollIntoView, toast, goToSheet, version: () => S.version, cfCache,
-  importFile: (f) => importFile(f)
+  importFile: (f) => importFile(f),
+  computeValues: (areas, opts) => computeValues(areas, opts), notComputed: (status) => notComputed(status),
+  usedAreas: (sheets) => usedAreas(sheets)
 };
 
 /* ================================================================ data changes */
@@ -220,22 +234,178 @@ function dataChanged(why) {
   S.version++;
   engine.invalidate();
   cfCache.clear();
+  calcRounds = 0; calcDone = -1; heavyMs = 0; roundMs = 0;
+  statusWait = null;
   S.layout = null;
   S.filtered = null;
   const sh = sheet();
   if (sh && sh.id !== S.sheetId) S.sheetId = sh.id;
   if (why === 'reset' && sh && !S.sels[sh.id]) S.sels[sh.id] = S.sel;
   clampSelection();
-  renderAll();
+  renderSafely();
 }
 
-function clampSelection() {
-  const sh = sheet();
+/** Draws everything. An error while drawing is logged; it must not stop saving, polling or later redraws. */
+function renderSafely() {
+  try { renderAll(); } catch (e) { console.error('Spreadsheets for YouTrack: could not draw the spreadsheet', e); }
+}
+
+/* A redraw that used up the formula work budget (formula.js) shows #CALC! for the formulas it did not get to. Computed
+ * values are kept, so another redraw gets further. It follows shortly, as long as each one computes something new, at
+ * most GRID_ROUNDS times in a row and within HEAVY_MS: a workbook that needs more keeps #CALC! (until it is drawn again)
+ * instead of keeping the page busy. */
+const CALC_ROUNDS = 20;   // rounds of the status bar for a selection (renderStatus)
+const GRID_ROUNDS = 100;  // rounds of the grid in a row: each one computes something new, and waste is limited apart
+// the time per change that drawing may waste on formulas the work budget stops before they computed anything (finding
+// out that a formula is too heavy can take a whole burst): past it, no more rounds follow. Drawing that computes
+// something wins time back, so a workbook of formulas that are only slow is computed to the end.
+const HEAVY_MS = 8000;
+// the time per change that rounds may take in all (formulas that are only slow included): past it, values that are
+// still missing are computed when the spreadsheet is drawn again (for example after a click)
+const GRID_MS = 40000;
+let calcTimer = 0, calcRounds = 0, calcDone = -1, heavyMs = 0, roundMs = 0;
+let calcHeld = false; // rounds were due while the page was in the background (they follow when the page is in front)
+let statusWait = null; // { rounds, done } while the status bar's totals wait for values (renderStatus)
+let gridPending = false; // the last drawing of the grid left formulas it did not get to
+/** Runs fn (drawing): heavyMs grows by the time it wasted on formulas the work budget stopped (Engine.wasted) and, when
+ * it computed something, shrinks by the rest of its time. */
+function timedDraw(fn) {
+  const t0 = performance.now(), w0 = engine.wasted(), p0 = engine.progress();
+  try { return fn(); } finally {
+    const waste = engine.wasted() - w0;
+    heavyMs += waste;
+    if (engine.progress() > p0) heavyMs = Math.max(0, heavyMs - Math.max(0, performance.now() - t0 - waste));
+  }
+}
+/** Whether drawing may go on in another round: GRID_ROUNDS rounds in a row at most, and HEAVY_MS per change. */
+const roundAllowed = () => calcRounds < GRID_ROUNDS && heavyMs <= HEAVY_MS && roundMs <= GRID_MS;
+/** Whether the status bar's totals may wait for another round (renderStatus). */
+const statusRoundAllowed = () => !!statusWait && statusWait.rounds < CALC_ROUNDS && heavyMs <= HEAVY_MS && roundMs <= GRID_MS;
+function continueCalc() {
+  if (!budgetSpent()) { calcRounds = 0; calcDone = -1; return; }
+  if (!roundAllowed()) return;
+  // a page in the background runs slower (its clock would stop formulas it can compute) and nobody looks at it: the
+  // round waits until it is in front
+  if (document.hidden) { calcHeld = true; return; }
+  const done = engine.progress();
+  if (done <= calcDone) return;
+  calcDone = done;
+  calcRounds++;
+  scheduleCalc();
+}
+function scheduleCalc() {
+  clearTimeout(calcTimer);
+  calcTimer = setTimeout(calcRound, 50);
+}
+/** One more round: table filters that were read while values were missing are worked out again, then the grid and
+ * the status bar (when its totals wait for values, or the hidden rows may change) are drawn. */
+function calcRound() {
+  calcTimer = 0;
+  if (!store.view) return;
+  const partial = !!(S.filtered && S.filtered.partial);
+  if (partial) { S.layout = null; S.filtered = null; }
+  const t0 = performance.now();
+  try {
+    renderGrid();
+    if (statusWait || partial) renderStatus(!!statusWait);
+  } catch (e) { console.error('Spreadsheets for YouTrack: could not draw the spreadsheet', e); }
+  roundMs += performance.now() - t0;
+}
+
+/* ---------------------------------------------------------------- values for commands
+ * A value the work budget left out reads as a placeholder (#CALC!, isSlowCalc), and the value read in the step that ran
+ * out may be wrong as well. Commands never sort, filter, deduplicate, paste, copy, export or total such values as if
+ * they were real: they compute the values they need first, in bursts with a pause in between. The page stays
+ * responsive, and computed values stay in the engine's cache, so each burst gets further. */
+const COMMAND_BURSTS = 40;
+const pause = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Computes the values of the cells in `areas` ([{ sheet, r1, c1, r2, c2 }], positions). Resolves to
+ *   'ok'       every value is computed;
+ *   'slow'     every value is computed except formulas that need more calculation than the spreadsheet does at once
+ *              (they keep #CALC! until the workbook changes);
+ *   'pending'  some values are not computed yet (the bursts ran out, or a burst computed nothing new);
+ *   'changed'  the workbook changed meanwhile, so positions the caller holds may be out of date;
+ *   'cancelled' opts.live() turned false (the dialog that asked was closed).
+ * opts.quiet: no "Calculating…" message while it takes more than one burst.
+ */
+async function computeValues(areas, opts = {}) {
+  const version = S.version;
+  const todo = [];
+  for (const a of areas) {
+    if (!a || !a.sheet) continue;
+    const r1 = Math.max(0, a.r1), c1 = Math.max(0, a.c1);
+    const r2 = Math.min(a.r2, a.sheet.rows.length - 1), c2 = Math.min(a.c2, a.sheet.cols.length - 1);
+    if (r1 <= r2 && c1 <= c2) todo.push({ sh: a.sheet, r1, c1, r2, c2 });
+  }
+  // the first cell that is not known to be computed: values before it stay in the cache until the workbook changes
+  let i = 0, r = todo.length ? todo[0].r1 : 0, c = todo.length ? todo[0].c1 : 0, slow = 0;
+  const step = () => {
+    const a = todo[i];
+    if (++c <= a.c2) return;
+    c = a.c1;
+    if (++r <= a.r2) return;
+    if (++i < todo.length) { r = todo[i].r1; c = todo[i].c1; }
+  };
+  /** One burst: true when every cell was read without running out of budget. */
+  const burst = () => {
+    while (i < todo.length) {
+      const v = engine.valueAt(todo[i].sh, r, c);
+      if (budgetSpent()) return false; // this value (and the ones after it) are not computed yet
+      if (isSlowCalc(v)) slow++;
+      step();
+    }
+    return true;
+  };
+  let told = !!opts.quiet;
+  for (let n = 0; ; n++) {
+    if (S.version !== version || !store.view) return 'changed';
+    if (opts.live && !opts.live()) return 'cancelled';
+    // the budget is shared by a whole burst: one that is already used up refills after a pause
+    if (!budgetSpent()) {
+      const at = i + ':' + r + ':' + c, done = engine.progress();
+      if (burst()) return slow ? 'slow' : 'ok';
+      // a burst that computed nothing new: more bursts would not get further. (The first one may have started with
+      // part of the budget used, by a redraw in the same task: it gets another try after a pause.)
+      if (n > 0 && at === i + ':' + r + ':' + c && done === engine.progress()) return 'pending';
+      if (!told) { told = true; toast('Calculating… This can take a moment.'); }
+    }
+    if (n >= COMMAND_BURSTS) return 'pending';
+    await pause();
+  }
+}
+
+/** Says why a command was not done (status from computeValues). */
+function notComputed(status) {
+  if (status === 'changed') toast('The spreadsheet changed while its values were being calculated. Try again.', 'error');
+  else if (status === 'slow') toast('Some formulas here need more calculation than the spreadsheet does at once (they show #CALC!), so this was not done.', 'error');
+  else toast('Some values are still being calculated. Try again in a moment.', 'error');
+}
+
+// the size of each sheet when its selection was last checked: selected whole columns (rows) that reached its end then
+// stay whole when the sheet grows (scrolling past the end adds rows and columns, and so can other people)
+const selDims = new Map();
+/** Keeps the selection inside its sheet. dims: the sheet's size when the selection was made ({ sheetId, maxR, maxC },
+ * from an undo entry), instead of the size remembered from the last check. */
+function clampSelection(dims) {
+  // the sheet the selection belongs to: while a formula picks references on another sheet, the edited one
+  const ed = S.editing, v = view();
+  const sh = (ed && ed.away && ed.sheetId !== S.sheetId && v && v.sheets.find((x) => x.id === ed.sheetId)) || sheet();
   if (!sh) return;
   const maxR = sh.rows.length - 1, maxC = sh.cols.length - 1;
+  const prev = dims && dims.sheetId === sh.id ? dims : selDims.get(sh.id);
+  selDims.set(sh.id, { maxR, maxC });
   const s = S.sel;
   const cl = (v, m) => Math.max(0, Math.min(m, v));
-  S.sel = { r: cl(s.r, maxR), c: cl(s.c, maxC), r1: cl(s.r1, maxR), c1: cl(s.c1, maxC), r2: cl(s.r2, maxR), c2: cl(s.c2, maxC) };
+  // a range from the first to the last row (column) of a sheet that had more than one counts as whole columns (rows)
+  const fit = (x) => ({
+    r1: cl(x.r1, maxR), c1: cl(x.c1, maxC),
+    r2: prev && prev.maxR > 0 && maxR > prev.maxR && x.r1 === 0 && x.r2 === prev.maxR ? maxR : cl(x.r2, maxR),
+    c2: prev && prev.maxC > 0 && maxC > prev.maxC && x.c1 === 0 && x.c2 === prev.maxC ? maxC : cl(x.c2, maxC)
+  });
+  const more = (s.more || []).map(fit);
+  S.sel = { r: cl(s.r, maxR), c: cl(s.c, maxC), ...fit(s), ...(more.length ? { more } : {}) };
 }
 
 /**
@@ -249,7 +419,9 @@ function commit(ops, opts = {}) {
     try { store.apply(ops, { regen: opts.regen }); } catch (e) { toast(e.message || String(e), 'error'); return false; }
     return true;
   }
-  const entry = { label: opts.label || '', sheetId: S.sheetId, sel: { ...S.sel }, ops: null };
+  // dims: the sheet's size at this point, so that whole columns (rows) of the selection stay whole when undo brings it
+  // back after the sheet grew
+  const entry = { label: opts.label || '', sheetId: S.sheetId, sel: { ...S.sel }, dims: selDims.get(S.sheetId), ops: null };
   try {
     entry.ops = store.apply(ops, { regen: opts.regen, undoEntry: entry });
   } catch (e) {
@@ -269,7 +441,7 @@ function undoRedo(isRedo) {
   let entry = from.pop();
   while (entry && entry.dead) entry = from.pop();
   if (!entry) return;
-  const back = { label: entry.label, sheetId: S.sheetId, sel: { ...S.sel }, ops: null };
+  const back = { label: entry.label, sheetId: S.sheetId, sel: { ...S.sel }, dims: selDims.get(S.sheetId), ops: null };
   try {
     back.ops = store.apply(entry.ops, { undoEntry: back });
   } catch (e) {
@@ -280,7 +452,7 @@ function undoRedo(isRedo) {
   if (entry.sheetId && view().sheets.some((s) => s.id === entry.sheetId)) {
     if (entry.sheetId !== S.sheetId) goToSheet(entry.sheetId);
     S.sel = { ...entry.sel };
-    clampSelection();
+    clampSelection(entry.dims && { ...entry.dims, sheetId: entry.sheetId }); // the size the selection was made at (see commit)
     scrollIntoView(S.sel.r, S.sel.c);
   }
   renderAll();
@@ -311,11 +483,29 @@ function layout() { if (!S.layout || S.layout.sh !== sheet()) S.layout = compute
 
 /** Merge containing (r, c) as positions, or null. */
 function mergeAt(sh, r, c) {
-  const x = ix(sh);
-  for (const m of sh.merges) { const rect = M.objRect(m, x); if (M.inRect(rect, r, c)) return rect; }
+  for (const rect of mergeRects(sh)) if (M.inRect(rect, r, c)) return rect;
   return null;
 }
-function mergeRects(sh) { const x = ix(sh); return sh.merges.map((m) => M.objRect(m, x)).filter(Boolean); }
+const mergeCache = new WeakMap();
+/**
+ * Merged ranges of a sheet as positions. Like the server, only ranges larger than one cell that do not overlap an
+ * earlier one count (data stored by older versions may break these rules), at most LIMITS.merges of them.
+ */
+function mergeRects(sh) {
+  const x = ix(sh);
+  const hit = mergeCache.get(sh);
+  if (hit && hit.merges === sh.merges && hit.x === x) return hit.rects;
+  const rects = [];
+  for (const m of sh.merges) {
+    if (rects.length >= Core.LIMITS.merges) break;
+    const R = M.objRect(m, x);
+    if (!R || (R.r1 === R.r2 && R.c1 === R.c2)) continue;
+    if (rects.some((o) => o.r1 <= R.r2 && R.r1 <= o.r2 && o.c1 <= R.c2 && R.c1 <= o.c2)) continue;
+    rects.push(R);
+  }
+  mergeCache.set(sh, { merges: sh.merges, x, rects });
+  return rects;
+}
 
 /** Grows a rectangle so that it covers every merge it touches (selections never cut a merge in half). */
 function expandForMerges(sh, rect) {
@@ -368,7 +558,8 @@ function renderBar() {
   const fresh = store.meta || {};
   const m = store.view ? {
     sheets: store.view.sheets.length,
-    updatedAt: fresh.updatedAt || store.view.updatedAt, updatedByName: fresh.updatedByName || store.view.updatedByName
+    updatedAt: fresh.updatedAt || store.view.updatedAt, updatedByName: fresh.updatedByName || store.view.updatedByName,
+    updatedBy: fresh.updatedBy || store.view.updatedBy
   } : null;
   const loading = !store.loaded && !meta.dataset.error;
   meta.classList.toggle('loading', loading);
@@ -379,8 +570,8 @@ function renderBar() {
     const edited = m.updatedAt ? (Date.now() - Date.parse(m.updatedAt) < 60000 ? 'just now' : relTime(m.updatedAt, 'en')) : '';
     meta.textContent = (m.sheets === 1 ? '1 sheet' : m.sheets + ' sheets') + (edited ? ' · edited ' + edited + (m.updatedByName ? ' by ' + m.updatedByName : '') : '');
   }
-  // the text is cut off when the bar is narrow: the whole text as a tooltip
-  meta.title = loading ? '' : meta.textContent;
+  // the text is cut off when the bar is narrow: the whole text as a tooltip, with the login (display names are not unique)
+  meta.title = loading ? '' : meta.textContent + (m && m.updatedBy && m.updatedBy !== m.updatedByName ? ' (' + m.updatedBy + ')' : '');
   $('moreBtn').hidden = !store.loaded;
 }
 
@@ -414,8 +605,10 @@ function renderPeers() {
     const sh = store.view && store.view.sheets.find((s) => s.id === p.s);
     let where = '';
     if (sh && p.k) { const label = Core.cellLabel(sh, p.k); where = ' · ' + sh.name + '!' + label; }
+    // display names can look alike: the login (unique) is part of the tooltip, as in the bar and the history
+    const who = p.login && p.login !== p.name ? p.name + ' (' + p.login + ')' : p.name;
     el.appendChild(h('span', {
-      class: 'peer', style: { background: peerColor(p.login) }, title: p.name + where + (p.editing ? ' (typing)' : ''),
+      class: 'peer', style: { background: peerColor(p.login) }, title: who + where + (p.editing ? ' (typing)' : ''),
       onclick: () => { if (sh && p.k) { goToSheet(sh.id); const [rid, cid] = p.k.split(':'); const r = ix(sh).rows.get(rid), c = ix(sh).cols.get(cid); if (r !== undefined) { selectCell(r, c); scrollIntoView(r, c); } } }
     }, initials(p.name)));
   }
@@ -450,8 +643,10 @@ function renderEmpty() {
 async function createWorkbook(sheets) {
   try {
     const res = await api('create', { method: 'POST', body: sheets ? { sheets } : {} });
-    store.confirmed = Core.upgrade(res.doc);
-    store.rev = res.doc.rev;
+    const doc = Core.cleanDoc(res.doc);
+    if (!doc) throw new Error('The spreadsheet could not be loaded.');
+    store.confirmed = doc;
+    store.rev = doc.rev;
     store.exists = true;
     store.pending = [];
     store.rebuild();
@@ -702,6 +897,10 @@ function autoGrowBar() {
 
 const styleCache = new Map();
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+/** A #rrggbb color, or null. Colors come from stored data, so nothing else may reach a style. */
+const hex = (c) => (typeof c === 'string' && HEX_COLOR.test(c) ? c : null);
+const ALIGN_H = ['left', 'center', 'right'], ALIGN_V = ['top', 'middle', 'bottom'], FONTS = ['sans', 'serif', 'mono'];
+const CELL_TEXT = 4000; // characters a cell and its note tooltip show in the grid
 /**
  * Inline style and classes of a cell: { css, cls }.
  * Fills and text colors that people pick (#rrggbb, in cells and in the formats of conditional formatting rules) are
@@ -709,6 +908,7 @@ const HEX_COLOR = /^#[0-9a-f]{6}$/i;
  * and a lighter text for the dark theme (themedColors, app.css), so that colored cells stay readable there.
  * Table bands, data bars and color-scale fills (scaleFill: cf.bg comes from a color scale) keep their colors in both
  * themes: the order of a scale's colors is its meaning. Text on a scale fill gets a color that is readable on it.
+ * Only checked values get in: #rrggbb colors, the table band (rgba from a table style), known fonts, numbers.
  */
 function cellCss(st, cf, band, z, scaleFill) {
   const key = JSON.stringify([st, cf, band, z, !!scaleFill]);
@@ -717,28 +917,27 @@ function cellCss(st, cf, band, z, scaleFill) {
   const s = st || {};
   const parts = [];
   let cls = '';
-  const bg = (cf && cf.bg) || s.bg || band || null;
-  const fc = (cf && cf.fc) || s.fc || null;
-  if (scaleFill && bg) {
-    parts.push('background:' + bg);
-    const t = fc || contrastText(bg);
+  const fill = hex(cf && cf.bg) || hex(s.bg);
+  const fc = hex(cf && cf.fc) || hex(s.fc);
+  if (scaleFill && fill) {
+    parts.push('background:' + fill);
+    const t = fc || hex(contrastText(fill));
     if (t) parts.push('color:' + t);
   } else {
-    const userFill = bg && bg !== band && HEX_COLOR.test(bg) ? bg : null;
+    const userFill = fill && fill !== band ? fill : null;
     const tc = themedColors(userFill, fc);
     cls += tc.cls;
     parts.push(...tc.parts);
-    if (!userFill && bg) parts.push('background:' + bg);
-    if (fc && !HEX_COLOR.test(fc)) parts.push('color:' + fc);
+    if (!userFill && band) parts.push('background:' + band);
   }
   if (s.b || (cf && cf.b)) parts.push('font-weight:600');
   if (s.i || (cf && cf.i)) parts.push('font-style:italic');
   const deco = [s.u ? 'underline' : '', s.x || (cf && cf.x) ? 'line-through' : ''].filter(Boolean).join(' ');
   if (deco) parts.push('text-decoration:' + deco);
-  if (s.fs) parts.push('font-size:' + Math.round(s.fs * z) + 'px');
-  if (s.ff) parts.push('font-family:var(--font-' + s.ff + ')');
-  if (s.bd) {
-    const c = s.bc || 'var(--cell-border)';
+  if (typeof s.fs === 'number' && s.fs >= 6 && s.fs <= 72) parts.push('font-size:' + Math.round(s.fs * z) + 'px');
+  if (FONTS.includes(s.ff)) parts.push('font-family:var(--font-' + s.ff + ')');
+  if (typeof s.bd === 'string' && /^[tlrbTLRB]{1,8}$/.test(s.bd)) {
+    const c = hex(s.bc) || 'var(--cell-border)';
     const w = (ch) => (s.bd.includes(ch.toUpperCase()) ? 2 : s.bd.includes(ch) ? 1 : 0);
     const shadows = [];
     if (w('t')) shadows.push(`inset 0 ${w('t')}px 0 ${c}`);
@@ -774,8 +973,9 @@ function visibleRowRange(L) {
   let b = a;
   while (b < n && L.rowTop[b] - base < y1) b++;
   b = Math.min(n - 1, b + 8);
-  // include the first row of merges that reach into the window
-  for (const m of mergeRects(sh)) if (m.r1 < a && m.r2 >= a && m.r1 >= L.fr) a = m.r1;
+  // include the first row of merges that reach into the window (up to 200 rows up: a merge that starts further up is
+  // drawn as separate cells, so a merge as tall as the sheet cannot make every redraw draw the whole sheet)
+  for (const m of mergeRects(sh)) if (m.r1 < a && m.r2 >= a && m.r1 >= L.fr && a - m.r1 <= 200) a = m.r1;
   return [a, b];
 }
 
@@ -783,13 +983,18 @@ function selectionDecos(sh) {
   const out = [];
   const s = S.sel;
   if (!S.editing || S.editing.sheetId === sh.id) {
-    const rect = expandForMerges(sh, { r1: s.r1, c1: s.c1, r2: s.r2, c2: s.c2 });
-    const single = rect.r1 === rect.r2 && rect.c1 === rect.c2 || (mergeAt(sh, s.r, s.c) && JSON.stringify(mergeAt(sh, s.r, s.c)) === JSON.stringify(rect));
-    out.push({ rect, cls: single ? 'd-sel single' : 'd-sel', fill: !single });
+    if (multiSel()) {
+      // several ranges: each one shaded and outlined, single cells too
+      for (const x of selRects()) out.push({ rect: expandForMerges(sh, x), cls: 'd-sel', fill: true });
+    } else {
+      const rect = expandForMerges(sh, { r1: s.r1, c1: s.c1, r2: s.r2, c2: s.c2 });
+      const single = rect.r1 === rect.r2 && rect.c1 === rect.c2 || (mergeAt(sh, s.r, s.c) && JSON.stringify(mergeAt(sh, s.r, s.c)) === JSON.stringify(rect));
+      out.push({ rect, cls: single ? 'd-sel single' : 'd-sel', fill: !single });
+    }
     const act = mergeAt(sh, s.r, s.c) || { r1: s.r, c1: s.c, r2: s.r, c2: s.c };
     out.push({ rect: act, cls: 'd-act', act: true });
   }
-  if (S.ants && S.ants.sheetId === sh.id) out.push({ rect: S.ants.rect, cls: 'd-ants' });
+  if (S.ants && S.ants.sheetId === sh.id) for (const rect of S.ants.rects || [S.ants.rect]) out.push({ rect, cls: 'd-ants' });
   for (const p of S.presence) {
     if (p.s !== sh.id || !p.k) continue;
     const x = ix(sh);
@@ -820,7 +1025,9 @@ function selectionDecos(sh) {
 }
 const REF_COLORS = ['#3369d6', '#d9480f', '#7a4fd6', '#1f8039', '#c2255c', '#0b7285', '#e67700'];
 
-function decoHtml(decos, r1, c1, r2, c2, isAnchorBottomRight) {
+/** Decorations of a drawn cell (rows r1..r2, columns c1..c2). first: the row of the cell's content, above r1 when a
+ * merge is drawn clipped (its outline then has no top edge). */
+function decoHtml(decos, r1, c1, r2, c2, isAnchorBottomRight, first = r1) {
   let out = '';
   for (const d of decos) {
     const R = d.rect;
@@ -828,14 +1035,17 @@ function decoHtml(decos, r1, c1, r2, c2, isAnchorBottomRight) {
     const t = R.r1 >= r1 && R.r1 <= r2 ? 1 : 0, b = R.r2 >= r1 && R.r2 <= r2 ? 1 : 0;
     const l = R.c1 >= c1 && R.c1 <= c2 ? 1 : 0, rr = R.c2 >= c1 && R.c2 <= c2 ? 1 : 0;
     if (d.act) {
-      if (!(R.r1 === r1 && R.c1 === c1)) continue;
-      out += `<div class="deco d-act"></div>`;
+      if (!(R.r1 === first && R.c1 === c1)) continue;
+      // a part of a merge: no edge where the merge goes on above it or below it
+      const cut = (first < r1 ? 'border-top-width:0;' : '') + (R.r2 > r2 ? 'border-bottom-width:0;' : '');
+      out += cut ? `<div class="deco d-act" style="${cut}"></div>` : '<div class="deco d-act"></div>';
       continue;
     }
     const w = d.cls === 'd-spill' || d.cls === 'd-fillpre' ? 1 : 2;
-    const style = `border-width:${t * w}px ${rr * w}px ${b * w}px ${l * w}px` + (d.color ? `;--dc:${d.color}` : '');
-    out += `<div class="deco ${d.cls}${d.fill ? ' fill' : ''}" style="${style}"></div>`;
-    if (d.label && d.labelAt && d.labelAt.r >= r1 && d.labelAt.r <= r2 && d.labelAt.c >= c1 && d.labelAt.c <= c2) out += `<div class="peer-tag${d.recent ? ' recent' : ''}" style="--dc:${d.color}">${esc(d.label)}</div>`;
+    const dc = hex(d.color);
+    const style = `border-width:${t * w}px ${rr * w}px ${b * w}px ${l * w}px` + (dc ? `;--dc:${dc}` : '');
+    out += `<div class="deco ${esc(d.cls)}${d.fill ? ' fill' : ''}" style="${esc(style)}"></div>`;
+    if (d.label && d.labelAt && d.labelAt.r >= r1 && d.labelAt.r <= r2 && d.labelAt.c >= c1 && d.labelAt.c <= c2) out += `<div class="peer-tag${d.recent ? ' recent' : ''}"${dc ? ` style="--dc:${dc}"` : ''}>${esc(d.label)}</div>`;
   }
   if (isAnchorBottomRight) out += '<div class="fill-handle" data-fill="1"></div>';
   return out;
@@ -844,6 +1054,16 @@ function decoHtml(decos, r1, c1, r2, c2, isAnchorBottomRight) {
 function renderGrid() {
   const sh = sheet();
   if (!sh) return;
+  // rows hidden by a filter that was read while values were missing (filteredFor) are worked out again by any redraw
+  // that has budget, also once continueCalc's rounds are over; the status bar's totals wait for them (renderStatus)
+  const refilter = !!(S.filtered && S.filtered.partial) && !budgetSpent();
+  if (refilter) { S.layout = null; S.filtered = null; }
+  timedDraw(() => drawGrid(sh));
+  gridPending = budgetSpent();
+  if (refilter && S.filtered && !S.filtered.partial) renderStatus(!!statusWait);
+  continueCalc();
+}
+function drawGrid(sh) {
   const L = layout();
   const z = L.z;
   const table = $('grid');
@@ -854,13 +1074,34 @@ function renderGrid() {
   const decos = selectionDecos(sh);
   const s = S.sel;
   const selRectX = expandForMerges(sh, { r1: s.r1, c1: s.c1, r2: s.r2, c2: s.c2 });
-  const showHandle = canEdit() && !S.editing;
+  // headers of the selected rows and columns, of every selected range; "full" for whole rows and columns
+  const allSel = multiSel() ? selRects().map((x) => expandForMerges(sh, x)) : [selRectX];
+  const lastR = sh.rows.length - 1, lastC = sh.cols.length - 1;
+  const colHl = (c) => { let inSel = false, full = false; for (const x of allSel) if (c >= x.c1 && c <= x.c2) { inSel = true; if (x.r1 === 0 && x.r2 === lastR) { full = true; break; } } return [inSel, full]; };
+  const rowHl = (r) => { let inSel = false, full = false; for (const x of allSel) if (r >= x.r1 && r <= x.r2) { inSel = true; if (x.c1 === 0 && x.c2 === lastC) { full = true; break; } } return [inSel, full]; };
+  // no fill handle with several ranges (as in Excel)
+  const showHandle = canEdit() && !S.editing && !multiSel();
   const merges = mergeRects(sh);
   const covered = new Set();
   const anchors = new Map();
+  // only the rows that are drawn (frozen rows and the window a..b) are marked, so a huge merge costs nothing extra. A
+  // merge is drawn in parts: its frozen rows, and its rows in the window. A part that does not start at the merge's
+  // first row (the merge starts above the window, more than 200 rows up, see visibleRowRange, or above the freeze line,
+  // or its first rows are hidden) is drawn clipped: its cell starts at the part's first shown row and shows the merge's
+  // own cell, placed as in the whole merge (rowsHtml). Each part has a cell: without one, the cells right of it would
+  // be drawn a column to the left.
   for (const m of merges) {
-    anchors.set(m.r1 + ':' + m.c1, m);
-    for (let r = m.r1; r <= m.r2; r++) for (let c = m.c1; c <= m.c2; c++) if (r !== m.r1 || c !== m.c1) covered.add(r + ':' + c);
+    const parts = [];
+    if (m.r1 < L.fr) parts.push([m.r1, Math.min(m.r2, L.fr - 1)]);
+    const w1 = Math.max(m.r1, L.fr, a), w2 = Math.min(m.r2, b);
+    if (w1 <= w2) parts.push([w1, w2]);
+    for (const [p1, p2] of parts) {
+      let top = p1;
+      while (top <= p2 && !L.rowH[top]) top++;
+      if (top > p2) continue; // every row of this part is hidden
+      anchors.set(top + ':' + m.c1, m);
+      for (let r = top; r <= p2; r++) for (let c = m.c1; c <= m.c2; c++) if (r !== top || c !== m.c1) covered.add(r + ':' + c);
+    }
   }
   const x = ix(sh);
   // tables (header, bands, totals, filter buttons)
@@ -885,8 +1126,7 @@ function renderGrid() {
   for (const c of visCols) if (c < L.fc) lastFzC = c;
   for (let r = 0; r < L.fr; r++) if (L.rowH[r] > 0) lastFzR = r;
   for (const c of visCols) {
-    const inSel = c >= selRectX.c1 && c <= selRectX.c2;
-    const full = inSel && selRectX.r1 === 0 && selRectX.r2 === sh.rows.length - 1;
+    const [inSel, full] = colHl(c);
     const frozen = c < L.fc;
     const hiddenBefore = c > 0 && L.colW[c - 1] === 0;
     head += `<th class="ch${inSel ? ' hl' : ''}${full ? ' full' : ''}${frozen ? ' fz' : ''}${c === lastFzC ? ' fz-last' : ''}${hiddenBefore ? ' hid-before' : ''}" data-ch="${c}" style="top:0${frozen ? `;left:${L.rhW + L.colLeft[c]}px` : ''}">${colName(c)}<span class="col-resize" data-cres="${c}"></span></th>`;
@@ -897,8 +1137,7 @@ function renderGrid() {
   const rowsHtml = (r, sticky) => {
     const hgt = L.rowH[r];
     if (!hgt) return '';
-    const inSel = r >= selRectX.r1 && r <= selRectX.r2;
-    const full = inSel && selRectX.c1 === 0 && selRectX.c2 === sh.cols.length - 1;
+    const [inSel, full] = rowHl(r);
     const hiddenBefore = r > 0 && L.rowH[r - 1] === 0;
     const topCss = sticky ? `top:${frozenTop}px;` : '';
     let html = `<tr style="height:${hgt}px" data-r="${r}"><th class="rh${inSel ? ' hl' : ''}${full ? ' full' : ''}${sticky ? ' fz' : ''}${r === lastFzR ? ' fz-last' : ''}${hiddenBefore ? ' hid-before' : ''}" data-rh="${r}" style="${topCss}left:0">${r + 1}<span class="row-resize" data-rres="${r}"></span></th>`;
@@ -911,22 +1150,29 @@ function renderGrid() {
       if (m) {
         r2 = m.r2; c2 = m.c2;
         colspan = visCols.filter((cc) => cc >= m.c1 && cc <= m.c2).length;
-        for (let rr = m.r1; rr <= m.r2; rr++) if (L.rowH[rr] > 0 && (sticky ? rr < L.fr : rr >= L.fr)) rowspan += rr === r ? 0 : 1;
+        for (let rr = r; rr <= m.r2; rr++) if (L.rowH[rr] > 0 && (sticky ? rr < L.fr : rr >= L.fr)) rowspan += rr === r ? 0 : 1;
       }
-      const cell = sh.cells[sh.rows[r] + ':' + sh.cols[c]];
+      // the row whose cell is shown: a merge shows its first cell, also when it is drawn clipped from a later row
+      const vr = m ? m.r1 : r;
+      const cell = sh.cells[sh.rows[vr] + ':' + sh.cols[c]];
       const st = cell && cell.st;
       const frozenC = c < L.fc;
-      let v = engine.valueAt(sh, r, c);
+      let v = engine.valueAt(sh, vr, c);
       const raw = cell ? cell.v : undefined;
       let text = S.showFormulas && raw && raw[0] === '=' ? fmlLocal(raw) : formatValue(v, st, LOCALE);
-      const cf = hasCf ? M.cfFor(engine, sh, r, c, x, cfCache) : null;
+      // a cell shows at most CELL_TEXT characters (the formula bar and the editor show all of it): long computed texts
+      // in many cells cannot make the page huge
+      if (text.length > CELL_TEXT) text = text.slice(0, CELL_TEXT) + '…';
+      const cf = hasCf ? M.cfFor(engine, sh, vr, c, x, cfCache) : null;
       // table styling: a tinted header row with a line in the table color, light bands
       let band = null, tclass = '', filterBtn = '', headLine = null;
       for (const { t, rect } of tables) {
-        if (!M.inRect(rect, r, c)) continue;
-        const color = M.TABLE_STYLES[t.style || 'blue'];
-        const isHeader = t.header !== false && r === rect.r1;
-        const isTotal = t.totals && r === rect.r2;
+        if (!M.inRect(rect, vr, c)) continue;
+        // a known style name only: it becomes a class and picks the table color
+        const tstyle = Core.TABLE_STYLES.includes(t.style) ? t.style : 'blue';
+        const color = M.TABLE_STYLES[tstyle];
+        const isHeader = t.header !== false && vr === rect.r1;
+        const isTotal = t.totals && vr === rect.r2;
         if (isHeader) {
           if (color) { band = hexAlpha(color, 0.14); headLine = color; }
           tclass += ' t-head';
@@ -940,30 +1186,30 @@ function renderGrid() {
         else if (color && t.banded !== false) {
           // bands follow the visible rows, so filtered tables stay striped
           let idx = 0;
-          for (let rr = rect.r1 + (t.header !== false ? 1 : 0); rr < r; rr++) if (L.rowH[rr] > 0) idx++;
+          for (let rr = rect.r1 + (t.header !== false ? 1 : 0); rr < vr; rr++) if (L.rowH[rr] > 0) idx++;
           if (idx % 2 === 0) band = hexAlpha(color, 0.09);
         }
-        if (r === rect.r1) tclass += ' t-top';
-        if (r === rect.r2) tclass += ' t-bottom';
+        if (vr === rect.r1) tclass += ' t-top';
+        if (vr === rect.r2) tclass += ' t-bottom';
         if (c === rect.c1) tclass += ' t-left';
         if (c === rect.c2) tclass += ' t-right';
-        tclass += ' t-' + (t.style || 'blue');
+        tclass += ' t-' + tstyle;
         break;
       }
-      const cc = cellCss(st, cf, band, z, isScaleFill(cf, r, c));
+      const cc = cellCss(st, cf, band, z, isScaleFill(cf, vr, c));
       let css = cc.css;
       if (headLine) css += ';border-bottom-color:' + headLine;
       // alignment: numbers right, booleans/errors centered, text left (like Excel)
       const isNum = typeof v === 'number' && !(S.showFormulas && raw && raw[0] === '=');
-      const ha = (st && st.ha) || (isNum ? 'right' : (typeof v === 'boolean' || isErr(v)) ? 'center' : 'left');
-      const va = (st && st.va) || 'bottom';
+      const ha = (st && ALIGN_H.includes(st.ha) && st.ha) || (isNum ? 'right' : (typeof v === 'boolean' || isErr(v)) ? 'center' : 'left');
+      const va = (st && ALIGN_V.includes(st.va) && st.va) || 'bottom';
       const wrap = st && st.w;
       let cls = 'cell a-' + ha + ' v-' + va + (wrap ? ' wrap' : '') + tclass + cc.cls + (filterBtn ? ' has-flt' : '');
       if (frozenC) cls += ' fzc';
       if (sticky) cls += ' fzr';
       if (sh.nogrid) cls += ' nogrid';
       if (isErr(v)) cls += ' err';
-      const spillAnchor = !cell && v !== null ? engine.spillAnchorOf(sh, r, c) : null;
+      const spillAnchor = !cell && v !== null ? engine.spillAnchorOf(sh, vr, c) : null;
       if (spillAnchor) cls += ' spilled';
       if (skipOverflow > 0) { cls += ' ovl'; skipOverflow--; }
       // overflow of long left-aligned text into empty neighbours
@@ -986,33 +1232,53 @@ function renderGrid() {
       if (isNum && !wrap && text.length * 7.2 * z > width - 6 && width > 0) text = '#'.repeat(Math.max(1, Math.floor((width - 6) / (7.2 * z))));
       // content
       let inner = '';
-      const link0 = typeof v === 'string' && /^(https?:\/\/|mailto:)[^\s]+$/i.test(v) ? v : engine.linkAt(sh, r, c);
+      const link0 = typeof v === 'string' && /^(https?:\/\/|mailto:)[^\s]+$/i.test(v) ? v : engine.linkAt(sh, vr, c);
       const link = link0 && /^(https?:\/\/|mailto:)/i.test(link0) ? link0 : null; // never javascript: or data: links
-      const dvo = dvRects.find((o) => M.inRect(o.rect, r, c));
+      const dvo = dvRects.find((o) => M.inRect(o.rect, vr, c));
       if (dvo && dvo.d.type === 'checkbox' && (v === true || v === false || v === null)) {
         inner = `<span class="cbx${v === true ? ' on' : ''}" data-cbx="1" role="checkbox" aria-checked="${v === true}">${v === true ? icon('check', 12) : ''}</span>`;
         cls = cls.replace(/a-\w+/, 'a-center');
       } else if (link && !S.showFormulas) {
         inner = `<a class="lnk" href="${esc(link)}" target="_blank" rel="noopener noreferrer" data-link="1" title="Ctrl+click to open">${esc(text)}</a>`;
       } else inner = esc(text);
-      if (cf && cf.bar) {
+      if (cf && cf.bar && Number.isFinite(cf.bar.pct) && Number.isFinite(cf.bar.zero)) {
         const left = cf.bar.neg ? cf.bar.zero - cf.bar.pct : cf.bar.zero;
-        inner = `<span class="dbar" style="left:${left}%;width:${cf.bar.pct}%;background:${hexAlpha(cf.bar.color, 0.45)}"></span>` + inner;
+        inner = `<span class="dbar" style="left:${left}%;width:${cf.bar.pct}%;background:${hexAlpha(hex(cf.bar.color) || '#3369d6', 0.45)}"></span>` + inner;
       }
-      if (cf && cf.icon) inner = `<span class="cf-icon ${cf.icon}">${cf.icon === 'up' ? '▲' : cf.icon === 'down' ? '▼' : '▶'}</span>` + inner;
-      const innerH = (rowspan > 1 ? Array.from({ length: r2 - r + 1 }, (_, i) => L.rowH[r + i]).reduce((s2, x2) => s2 + x2, 0) : L.rowH[r]) - 1;
-      const cv = `<div class="cv" style="height:${innerH}px${ovW ? `;width:${ovW - 6}px` : ''}">${inner}</div>`;
+      if (cf && ['up', 'down', 'side'].includes(cf.icon)) inner = `<span class="cf-icon ${cf.icon}">${cf.icon === 'up' ? '▲' : cf.icon === 'down' ? '▼' : '▶'}</span>` + inner;
+      // a merge in the frozen rows that goes on below them is as tall as its frozen rows there (as tall as the whole
+      // merge, it stretched the frozen rows over the grid)
+      let innerH = (rowspan > 1 ? Array.from({ length: (sticky ? Math.min(r2, L.fr - 1) : r2) - r + 1 }, (_, i) => L.rowH[r + i]).reduce((s2, x2) => s2 + x2, 0) : L.rowH[r]) - 1;
+      let clip = '';
+      if (vr < r) {
+        // a part of a merge drawn clipped: the content is as tall as the whole merge (as its frozen rows, in the frozen
+        // rows) and starts where the merge starts (the cell hides what lies above its top), so its fill, alignment and
+        // text match the whole merge
+        innerH = L.rowTop[(sticky ? Math.min(m.r2, L.fr - 1) : m.r2) + 1] - L.rowTop[vr] - 1;
+        clip = `;margin-top:-${L.rowTop[r] - L.rowTop[vr]}px`;
+      }
+      // the frozen part of a merge that goes on below the freeze line: a box as tall as the frozen rows (which do not
+      // stretch) shows the top of the whole merge's content, so its text is drawn once, where it is in the whole merge
+      let wrapH = 0;
+      if (m && sticky && m.r2 >= L.fr) { wrapH = innerH; innerH = L.rowTop[m.r2 + 1] - L.rowTop[vr] - 1; }
+      let cv = `<div class="cv" style="height:${innerH}px${clip}${ovW ? `;width:${ovW - 6}px` : ''}">${inner}</div>`;
+      if (wrapH) cv = `<div class="cvw" style="height:${wrapH}px">${cv}</div>`;
       // extras: note marker, list arrow, decorations
       let extras = '';
       if (cell && cell.n) extras += '<span class="note-mark"></span>';
       if (filterBtn) extras += filterBtn;
-      const isActive = r === s.r && c === s.c;
+      const isActive = vr === s.r && c === s.c;
       if (dvo && dvo.d.type === 'list' && (isActive || dvo.d.arrows === 'always') && canEdit()) extras += `<button class="dv-btn" type="button" data-dv="1" tabindex="-1" aria-label="Choose from list">${icon('dropdown', 12)}</button>`;
-      const brR = m ? m.r2 : r, brC = m ? m.c2 : c;
-      extras += decoHtml(decos, r, c, brR, brC, showHandle && brR === selRectX.r2 && brC === selRectX.c2);
+      // the bottom of the part drawn: the frozen part of a merge that goes on below the freeze line has no bottom edge
+      // and no fill handle
+      const brR = m ? (sticky ? Math.min(m.r2, L.fr - 1) : m.r2) : r, brC = m ? m.c2 : c;
+      // a part that starts below the merge's first row only because the rows between are hidden is the merge's top
+      const topR = m && vr < r && L.rowTop[r] === L.rowTop[vr] ? vr : r;
+      extras += decoHtml(decos, topR, c, brR, brC, showHandle && brR === selRectX.r2 && brC === selRectX.c2, vr);
       const leftCss = frozenC ? `left:${L.rhW + L.colLeft[c]}px;` : '';
-      const title = cell && cell.n ? ` title="${esc(cell.n)}"` : isErr(v) ? ` title="${esc(errorHelp(v.code))}"` : '';
-      html += `<td class="${cls}" data-r="${r}" data-c="${c}"${colspan > 1 ? ` colspan="${colspan}"` : ''}${rowspan > 1 ? ` rowspan="${rowspan}"` : ''} style="${topCss}${leftCss}${css}"${title}>${cv}${extras}</td>`;
+      const title = cell && cell.n ? ` title="${esc(String(cell.n).slice(0, CELL_TEXT))}"` : isErr(v) ? ` title="${esc(errorHelp(v, sh, vr, c))}"` : '';
+      // class and style are built from checked values only; they are escaped as well, so nothing can leave the attribute
+      html += `<td class="${esc(cls)}" data-r="${r}" data-c="${c}"${vr !== r ? ` data-mr="${vr}"` : ''}${colspan > 1 ? ` colspan="${colspan}"` : ''}${rowspan > 1 ? ` rowspan="${rowspan}"` : ''} style="${esc(topCss + leftCss + css)}"${title}>${cv}${extras}</td>`;
     }
     html += '</tr>';
     if (sticky) frozenTop += hgt;
@@ -1032,13 +1298,20 @@ function renderGrid() {
   if (S.editing && S.editing.sheetId === sh.id) positionEditor();
 }
 
-function errorHelp(code) {
+/** The tooltip of an error value (of the cell r, c of sheet sh). */
+function errorHelp(v, sh, r, c) {
+  // #CALC! of a formula that the work budget stopped, not an empty result: kept when the formula (or one it uses) is
+  // too heavy to compute, otherwise only not reached yet
+  if (isSlowCalc(v)) {
+    return sh && engine.keptSlow(sh, r, c) ? 'Not calculated: this formula, or one it uses, needs more calculation than the spreadsheet does at once'
+      : 'Not calculated yet: it is calculated when the spreadsheet is drawn again (for example after a click)';
+  }
   return {
     '#DIV/0!': 'Division by zero', '#N/A': 'Value not available (nothing matched)', '#NAME?': 'Unknown function or name',
     '#REF!': 'The formula refers to cells that no longer exist', '#VALUE!': 'Wrong type of value in the formula',
     '#NUM!': 'Invalid number', '#SPILL!': 'The result needs empty cells to spill into', '#CALC!': 'The result is empty',
     '#CIRC!': 'Circular reference: the formula depends on its own cell', '#ERROR!': 'The formula has a syntax error', '#NULL!': 'Ranges do not intersect'
-  }[code] || code;
+  }[v.code] || v.code;
 }
 
 /* ---------------------------------------------------------------- charts layer */
@@ -1051,21 +1324,31 @@ function renderCharts() {
   const L = layout();
   const x = ix(sh);
   const base = L.rowTop[L.fr];
+  const num = (v, d, lo, hi) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d);
   let html = '';
+  // a chart reads at most 2,000 rows and 25 columns, and one redraw reads at most 200,000 cells for all charts
+  let budget = 200000;
   for (const ch of charts) {
+    if (!ch || typeof ch !== 'object') continue;
     const ar = x.rows.get(ch.ar), ac = x.cols.get(ch.ac);
     if (ar === undefined || ac === undefined) continue;
-    const top = L.hdrH + L.frozenH + (ar >= L.fr ? L.rowTop[ar] - base : L.rowTop[ar] - L.frozenH) + (ch.oy || 0) * L.z;
-    const left = L.rhW + L.colLeft[ac] + (ch.ox || 0) * L.z;
-    const w = Math.round((ch.w || 480) * L.z), hh = Math.round((ch.h || 280) * L.z);
+    const top = L.hdrH + L.frozenH + (ar >= L.fr ? L.rowTop[ar] - base : L.rowTop[ar] - L.frozenH) + num(ch.oy, 0, 0, 10000) * L.z;
+    const left = L.rhW + L.colLeft[ac] + num(ch.ox, 0, 0, 10000) * L.z;
+    const w = Math.round(num(ch.w, 480, 40, 10000) * L.z), hh = Math.round(num(ch.h, 280, 40, 10000) * L.z);
     const rect = M.objRect(ch, x);
     let svg = '';
     if (rect) {
       const values = [], texts = [];
-      for (let r = rect.r1; r <= rect.r2; r++) {
+      const r2 = Math.min(rect.r2, rect.r1 + 1999), c2 = Math.min(rect.c2, rect.c1 + 24);
+      budget -= (r2 - rect.r1 + 1) * (c2 - rect.c1 + 1);
+      if (budget < 0) {
+        html += `<div class="chart" data-chart="${esc(ch.id)}" style="top:${top}px;left:${left}px;width:${w}px;height:${hh}px"></div>`;
+        continue;
+      }
+      for (let r = rect.r1; r <= r2; r++) {
         if (L.rowH[r] === 0) continue;
         const vr = [], tr = [];
-        for (let c = rect.c1; c <= rect.c2; c++) {
+        for (let c = rect.c1; c <= c2; c++) {
           if (L.colW[c] === 0) continue;
           const v = engine.valueAt(sh, r, c);
           const cell = M.cellAt(sh, r, c);
@@ -1095,9 +1378,10 @@ function renderTabs() {
       draggable: canEdit() ? 'true' : null, 'data-sheet': sh.id, 'data-label': sh.name
     }, sh.name);
     // a custom property needs setProperty (h() assigns style objects, which ignores them)
-    if (sh.color) { tab.classList.add('colored'); tab.style.setProperty('--tab-color', sh.color); }
+    if (hex(sh.color)) { tab.classList.add('colored'); tab.style.setProperty('--tab-color', sh.color); }
     tab.addEventListener('click', () => {
-      if (S.editing && S.editing.text[0] === '=' ) { S.sheetId = sh.id; S.layout = null; S.filtered = null; renderAll(); $('fbar').focus(); return; }
+      // a formula picks references on another sheet: that sheet is shown, S.sel stays the edited sheet's selection
+      if (S.editing && S.editing.text[0] === '=' ) { S.editing.away = true; S.sheetId = sh.id; S.layout = null; S.filtered = null; renderAll(); $('fbar').focus(); return; }
       goToSheet(sh.id);
     });
     tab.addEventListener('dblclick', () => renameSheet(sh));
@@ -1123,7 +1407,7 @@ function sheetMenuItems(sh, i) {
     { label: 'Move left', action: () => commit([{ t: 'moveSheet', s: sh.id, to: i - 1 }], { label: 'Move sheet' }), disabled: ro || i === 0 },
     { label: 'Move right', action: () => commit([{ t: 'moveSheet', s: sh.id, to: i + 1 }], { label: 'Move sheet' }), disabled: ro || i === view().sheets.length - 1 },
     { label: 'Tab color', disabled: ro, sub: [{ label: 'None', checked: !sh.color, action: () => commit([{ t: 'sheet', s: sh.id, color: null }]) }].concat(
-      TAB_COLORS.map(([name, c]) => ({ label: name, swatch: c, checked: (sh.color || '').toLowerCase() === c, action: () => commit([{ t: 'sheet', s: sh.id, color: c }]) }))) }
+      TAB_COLORS.map(([name, c]) => ({ label: name, swatch: c, checked: (hex(sh.color) || '').toLowerCase() === c, action: () => commit([{ t: 'sheet', s: sh.id, color: c }]) }))) }
   ];
 }
 
@@ -1157,6 +1441,7 @@ function goToSheet(id) {
   S.sels[S.sheetId] = { ...S.sel };
   S.sheetId = id;
   S.sel = S.sels[id] ? { ...S.sels[id] } : { r: 0, c: 0, r1: 0, c1: 0, r2: 0, c2: 0 };
+  if (S.editing) S.editing.away = false; // an edit that could not be saved stays open, but S.sel is now this sheet's
   S.layout = null;
   S.filtered = null;
   S.chartSel = null;
@@ -1168,23 +1453,72 @@ function goToSheet(id) {
   scrollIntoView(S.sel.r, S.sel.c);
 }
 
-function renderStatus() {
+/** The totals of the selection in the status bar. Totals that wait for values the work budget left out are drawn again
+ * in continueCalc's rounds (again = true): at most CALC_ROUNDS times, and only while each round computes something new.
+ * A new selection or change starts the rounds anew. */
+let statusTimer = 0, statusKey = ''; // statusKey: the selection (in this version of the workbook) the bar is about
+function renderStatus(again) {
   const sh = sheet();
   const s = S.sel;
   const el = $('status');
-  if (s.r1 === s.r2 && s.c1 === s.c2) { el.textContent = ''; return; }
-  let sum = 0, count = 0, nums = 0, min = Infinity, max = -Infinity;
-  const cells = (s.r2 - s.r1 + 1) * (s.c2 - s.c1 + 1);
-  if (cells > 200000) { el.textContent = ''; return; }
+  if (!again) statusWait = null;
+  clearTimeout(statusTimer);
+  statusTimer = 0;
+  const rects = selRects();
+  const key = S.version + '|' + S.sheetId + '|' + rects.map((x) => x.r1 + ':' + x.c1 + ':' + x.r2 + ':' + x.c2).join(';'), same = key === statusKey;
+  statusKey = key;
+  // totals for a selection of more than one cell; with several ranges (Ctrl+click), also of single cells
+  if (!multiSel() && s.r1 === s.r2 && s.c1 === s.c2) { statusWait = null; el.title = ''; el.textContent = ''; return; }
+  let sum = 0, count = 0, nums = 0, min = Infinity, max = -Infinity, slow = false;
+  const cells = rects.reduce((n, x) => n + (x.r2 - x.r1 + 1) * (x.c2 - x.c1 + 1), 0);
+  if (cells > 200000) { statusWait = null; el.title = ''; el.textContent = ''; return; }
+  // the work budget of this burst was used up before (drawing the grid): the totals are counted in a burst of their
+  // own, so that values that are computed are not taken for missing ones. Until then the bar keeps what it shows for
+  // this selection.
+  if (budgetSpent()) {
+    if (!same) { el.title = ''; el.textContent = 'Calculating…'; }
+    statusTimer = setTimeout(() => { statusTimer = 0; if (store.view) renderStatus(again); }, 0);
+    return;
+  }
+  el.title = '';
   const L = layout();
-  for (let r = s.r1; r <= s.r2; r++) {
-    if (L.rowH[r] === 0) continue;
-    for (let c = s.c1; c <= s.c2; c++) {
+  let heavy = false; // a value of the selection is kept as too heavy to compute (not only not computed yet)
+  const p0 = engine.progress();
+  timedDraw(() => {
+    // each cell once, also where ranges overlap
+    forSelectedCells((r, c) => {
+      if (L.rowH[r] === 0) return;
       const v = engine.valueAt(sh, r, c);
-      if (v === null || v === '') continue;
+      if (isSlowCalc(v)) { slow = true; if (engine.keptSlow(sh, r, c)) heavy = true; return; }
+      if (v === null || v === '') return;
       count++;
       if (typeof v === 'number') { nums++; sum += v; min = Math.min(min, v); max = Math.max(max, v); }
+    });
+  });
+  // values computed here that the grid shows as not computed yet: it is drawn again
+  if (gridPending && engine.progress() > p0 && !calcTimer && roundAllowed()) { if (document.hidden) calcHeld = true; else scheduleCalc(); }
+  // values the work budget left out, or rows a table filter cannot tell yet whether it hides (it reads values the
+  // budget left out): no totals without them. The rounds compute them, and the bar waits while they get further, at
+  // most CALC_ROUNDS times for a selection and within HEAVY_MS; then the totals say that they are not calculated.
+  const filterOnly = !slow && !budgetSpent() && !!(S.filtered && S.filtered.partial);
+  if (budgetSpent() || filterOnly) {
+    const done = engine.progress();
+    const w = statusWait || { rounds: 0, done: -1 };
+    if (done > w.done && w.rounds < CALC_ROUNDS && heavyMs <= HEAVY_MS && roundMs <= GRID_MS) { // see statusRoundAllowed
+      statusWait = { rounds: w.rounds + 1, done };
+      if (!calcTimer) { if (document.hidden) calcHeld = true; else scheduleCalc(); }
+      el.textContent = 'Calculating…';
+      return;
     }
+    slow = true;
+  }
+  statusWait = null;
+  if (slow) {
+    el.textContent = 'Not calculated';
+    el.title = heavy ? 'Some formulas in the selection need more calculation than the spreadsheet does at once.'
+      : filterOnly ? 'The table filter is not worked out yet, so it is not known which rows it hides. The totals follow when the spreadsheet is drawn again (for example after a click).'
+      : 'Some values in the selection are not calculated yet. They are calculated when the spreadsheet is drawn again (for example after a click).';
+    return;
   }
   // in the number format of the active cell when it has one, otherwise grouped: whole numbers exactly (up to 15 digits),
   // other numbers with up to 10 significant digits
@@ -1203,13 +1537,88 @@ function renderStatus() {
 
 /* ================================================================ selection */
 
+/** The active range (the one with the active cell). */
 function selRect() { const s = S.sel; return { r1: s.r1, c1: s.c1, r2: s.r2, c2: s.c2 }; }
+/* Several ranges: Ctrl+click (Cmd+click on a Mac) adds a range, as in Excel. Formatting, clearing, hiding, sizes and
+ * Ctrl+Enter act on all of them, Copy takes ranges over the same rows or the same columns as one block, and one copied
+ * cell pastes into all of them. Commands that work on one range say so (oneRange). */
+const MAX_RANGES = 100;
+/** All selected ranges, the active one last. */
+function selRects() { return [...(S.sel.more || []), selRect()]; }
+const multiSel = () => !!(S.sel.more && S.sel.more.length);
+/** With several ranges selected: says that the command works on one range, and returns true (the command does nothing). */
+function oneRange(what) {
+  if (!multiSel()) return false;
+  toast(what + ' works on one range at a time. Select a single range and try again.');
+  return true;
+}
+const rectsMeet = (a, b) => !(a.r2 < b.r1 || a.r1 > b.r2 || a.c2 < b.c1 || a.c1 > b.c2);
+/** True when two of the rectangles share a cell. */
+const rangesOverlap = (rects) => rects.some((a, i) => rects.some((b, j) => j > i && rectsMeet(a, b)));
+/** Each selected cell once (rows and columns as drawn: hidden ones too). */
+function forSelectedCells(fn) {
+  const rects = selRects();
+  // ranges that do not overlap need no bookkeeping (whole columns can be many cells)
+  if (!rangesOverlap(rects)) { for (const s of rects) for (let r = s.r1; r <= s.r2; r++) for (let c = s.c1; c <= s.c2; c++) fn(r, c); return; }
+  const seen = new Set();
+  for (const s of rects) for (let r = s.r1; r <= s.r2; r++) for (let c = s.c1; c <= s.c2; c++) {
+    const k = r * 1024 + c;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    fn(r, c);
+  }
+}
+/** The selected rows or columns (axis 'r' or 'c') of all ranges, in sheet order. */
+function selLines(axis) {
+  const out = new Set();
+  for (const s of selRects()) for (let i = axis === 'r' ? s.r1 : s.c1; i <= (axis === 'r' ? s.r2 : s.c2); i++) out.add(i);
+  return [...out].sort((a, b) => a - b);
+}
+/** The columns (axis 'c') or rows ('r') of the ranges that are whole columns (or rows) and contain index i; [i] alone otherwise. */
+function wholeLinesAt(axis, i) {
+  const sh = sheet();
+  const whole = selRects().filter((s) => (axis === 'c' ? s.r1 === 0 && s.r2 === sh.rows.length - 1 : s.c1 === 0 && s.c2 === sh.cols.length - 1));
+  if (!whole.some((s) => (axis === 'c' ? i >= s.c1 && i <= s.c2 : i >= s.r1 && i <= s.r2))) return [i];
+  const out = new Set();
+  for (const s of whole) for (let j = axis === 'c' ? s.c1 : s.r1; j <= (axis === 'c' ? s.c2 : s.r2); j++) out.add(j);
+  return [...out].sort((a, b) => a - b);
+}
 
 function selectRect(rect, active) {
   const sh = sheet();
   const R = expandForMerges(sh, rect);
   const a = active || { r: rect.r1, c: rect.c1 };
   S.sel = { r: a.r, c: a.c, r1: R.r1, c1: R.c1, r2: R.r2, c2: R.c2 };
+  clampSelection();
+  afterSelection();
+}
+/** Like selectRect, but the other selected ranges stay (dragging or Shift+clicking the range that was added last). */
+function setActiveRange(rect, active) {
+  const more = S.sel.more;
+  const sh = sheet();
+  const R = expandForMerges(sh, rect);
+  S.sel = { r: active.r, c: active.c, r1: R.r1, c1: R.c1, r2: R.r2, c2: R.c2, ...(more ? { more } : {}) };
+  clampSelection();
+  afterSelection();
+}
+/** Ctrl+click: adds a range to the selection; it becomes the active one, with its active cell at `active`. */
+function addRange(rect, active) {
+  const s = S.sel;
+  const more = [...(s.more || []), selRect()];
+  if (more.length >= MAX_RANGES) { toast('At most ' + MAX_RANGES + ' ranges can be selected at once.'); return false; }
+  const sh = sheet();
+  const R = expandForMerges(sh, rect);
+  S.sel = { r: active.r, c: active.c, r1: R.r1, c1: R.c1, r2: R.r2, c2: R.c2, more };
+  clampSelection();
+  afterSelection();
+  return true;
+}
+/** Changes every selected range (Ctrl+Space, Shift+Space): the active cell stays. */
+function mapRanges(fn) {
+  const sh = sheet(), s = S.sel;
+  const f = (x) => expandForMerges(sh, fn(x));
+  const R = f(selRect());
+  S.sel = { r: s.r, c: s.c, r1: R.r1, c1: R.c1, r2: R.r2, c2: R.c2, ...(s.more ? { more: s.more.map(f) } : {}) };
   clampSelection();
   afterSelection();
 }
@@ -1220,9 +1629,10 @@ function selectCell(r, c, extend, keepTabStart) {
   r = Math.max(0, Math.min(sh.rows.length - 1, r));
   c = Math.max(0, Math.min(sh.cols.length - 1, c));
   if (extend) {
+    // Shift: the active range grows from the active cell; the other selected ranges stay
     const a = { r: S.sel.r, c: S.sel.c };
     const R = expandForMerges(sh, { r1: Math.min(a.r, r), c1: Math.min(a.c, c), r2: Math.max(a.r, r), c2: Math.max(a.c, c) });
-    S.sel = { ...a, ...R };
+    S.sel = { ...a, ...R, ...(S.sel.more ? { more: S.sel.more } : {}) };
   } else {
     const m = mergeAt(sh, r, c);
     if (m) S.sel = { r: m.r1, c: m.c1, ...m };
@@ -1363,20 +1773,31 @@ function startEdit(text, mode, from = 'cell') {
   updateAutocomplete(ed);
 }
 
+/** The drawn cell of (r, c). A merge drawn clipped (renderGrid) starts at a later row: it is found by the row of its
+ * first cell as well. */
+function cellTd(r, c) {
+  const g = $('grid');
+  return g.querySelector(`td[data-r="${r}"][data-c="${c}"]`) || g.querySelector(`td[data-mr="${r}"][data-c="${c}"]`);
+}
 function positionEditor() {
   const ed = $('cellEditor');
   if (!S.editing || S.editing.sheetId !== S.sheetId || S.editing.from === 'bar' && ed.hidden) { if (!S.editing || S.editing.sheetId !== S.sheetId) ed.hidden = true; return; }
-  const td = $('grid').querySelector(`td[data-r="${S.editing.r}"][data-c="${S.editing.c}"]`);
+  const td = cellTd(S.editing.r, S.editing.c);
   if (!td) { ed.style.visibility = 'hidden'; return; }
   ed.style.visibility = '';
   const inner = $('gridInner').getBoundingClientRect();
   const rc = td.getBoundingClientRect();
   const cell = M.cellAt(sheet(), S.editing.r, S.editing.c);
   const st = (cell && cell.st) || {};
+  // a merge taller than the grid: the editor covers the part of it that is on screen, so that its text is in view
+  const wrap = $('gridWrap').getBoundingClientRect(), L = layout();
+  const tall = rc.height > wrap.height;
+  const top = tall ? Math.max(rc.top, wrap.top + L.hdrH + L.frozenH) : rc.top;
+  const height = tall ? Math.max(Math.min(rc.bottom, wrap.bottom) - top, L.rowH[S.editing.r] || 24) : rc.height;
   ed.style.left = (rc.left - inner.left) + 'px';
-  ed.style.top = (rc.top - inner.top) + 'px';
+  ed.style.top = (top - inner.top) + 'px';
   ed.style.minWidth = rc.width + 'px';
-  ed.style.minHeight = rc.height + 'px';
+  ed.style.minHeight = height + 'px';
   ed.style.maxWidth = Math.max(rc.width, inner.right - rc.left - 4, 200) + 'px';
   ed.style.fontWeight = st.b ? '600' : '';
   ed.style.fontStyle = st.i ? 'italic' : '';
@@ -1385,7 +1806,7 @@ function positionEditor() {
   ed.style.width = 'auto';
   ed.style.height = 'auto';
   ed.style.width = Math.min(parseFloat(ed.style.maxWidth), Math.max(rc.width, ed.scrollWidth + 4)) + 'px';
-  ed.style.height = Math.max(rc.height, ed.scrollHeight) + 'px';
+  ed.style.height = Math.max(height, ed.scrollHeight) + 'px';
 }
 
 function editorInput(src) {
@@ -1432,11 +1853,16 @@ function commitEdit(dr = 0, dc = 0, fillSelection = false) {
       toast(msg);
     }
   }
+  // a formula's references may have been picked on another sheet: the edit ends on its own sheet, whose selection S.sel
+  // still is (and whose layout tells which rows are hidden)
+  if (S.sheetId !== sh.id) { S.sheetId = sh.id; S.layout = null; S.filtered = null; }
   const cell = M.cellAt(sh, ed.r, ed.c);
   const ops = [];
   const targets = [];
-  if (fillSelection && (S.sel.r1 !== S.sel.r2 || S.sel.c1 !== S.sel.c2)) {
-    for (let r = S.sel.r1; r <= S.sel.r2; r++) for (let c = S.sel.c1; c <= S.sel.c2; c++) if (layout().rowH[r] > 0) targets.push([r, c]);
+  // Ctrl+Enter: into every selected cell (of every selected range) that is not hidden
+  if (fillSelection && (multiSel() || S.sel.r1 !== S.sel.r2 || S.sel.c1 !== S.sel.c2)) {
+    const L = layout();
+    forSelectedCells((r, c) => { if (L.rowH[r] > 0) targets.push([r, c]); });
   } else targets.push([ed.r, ed.c]);
   for (const [r, c] of targets) {
     const k = M.keyAt(sh, r, c);
@@ -1471,11 +1897,10 @@ function commitEdit(dr = 0, dc = 0, fillSelection = false) {
   const changed = ops.length > 1 || (cell ? cell.v : undefined) !== (ops[0].v ?? undefined) || ops[0].st !== undefined;
   S.editing = null;
   $('cellEditor').hidden = true;
-  if (S.sheetId !== sh.id) { S.sheetId = sh.id; S.layout = null; S.filtered = null; }
   if (changed) commit(ops, { label: 'Edit cell' });
   if (dr || dc) {
     const s = S.sel;
-    const multi = s.r1 !== s.r2 || s.c1 !== s.c2;
+    const multi = multiSel() || s.r1 !== s.r2 || s.c1 !== s.c2;
     if (multi && !fillSelection) moveWithinSelection(dr, dc);
     else {
       // Tab, Tab, Enter goes back to the column where the row was started, like Excel
@@ -1514,12 +1939,27 @@ function checkCustomRule(sh, r, c, dv, raw) {
   return res === true || (typeof res === 'number' && res !== 0) ? null : dv.msg || 'This value does not meet the validation rule of the cell.';
 }
 
-/** Enter / Tab inside a selected range cycle through it, like Excel. */
+/** Enter / Tab inside a selected range cycle through it, like Excel; past its last (first) cell, on to the next
+ * (previous) selected range when there are several. */
 function moveWithinSelection(dr, dc) {
   const s = S.sel;
   let r = s.r + dr, c = s.c + dc;
+  let wrapped = false;
   if (c > s.c2) { c = s.c1; r++; } else if (c < s.c1) { c = s.c2; r--; }
-  if (r > s.r2) { r = s.r1; c = dc ? c : (c + 1 > s.c2 ? s.c1 : c + 1); } else if (r < s.r1) { r = s.r2; c = dc ? c : (c - 1 < s.c1 ? s.c2 : c - 1); }
+  if (r > s.r2) { r = s.r1; if (dc || c + 1 > s.c2) { wrapped = true; if (!dc) c = s.c1; } else c = c + 1; }
+  else if (r < s.r1) { r = s.r2; if (dc || c - 1 < s.c1) { wrapped = true; if (!dc) c = s.c2; } else c = c - 1; }
+  if (wrapped && multiSel()) {
+    // the ranges in the order they were selected, the active one last: forward goes to the first, back to the last
+    const more = s.more.slice();
+    const cur = selRect();
+    const forward = dr > 0 || dc > 0;
+    const next = forward ? more.shift() : more.pop();
+    if (forward) more.push(cur); else more.unshift(cur);
+    S.sel = { r: forward ? next.r1 : next.r2, c: forward ? next.c1 : next.c2, r1: next.r1, c1: next.c1, r2: next.r2, c2: next.c2, more };
+    afterSelection();
+    scrollIntoView(S.sel.r, S.sel.c);
+    return;
+  }
   S.sel = { ...s, r, c };
   afterSelection();
   scrollIntoView(r, c);
@@ -1635,11 +2075,24 @@ function hideHint() { if (hintEl) hintEl.hidden = true; }
 
 /* ================================================================ commands */
 
+/** Style ops for every selected range: patchFor(rect) gives the patch of each one (see M.styleOpsMulti). */
+function selectionStyleOps(patchFor) {
+  const sh = sheet();
+  return multiSel() ? M.styleOpsMulti(sh, selRects(), patchFor) : M.styleOps(sh, selRect(), patchFor(selRect()));
+}
 function applyStyle(patch) {
   const sh = sheet();
   if (!sh || !canEdit()) return;
-  const ops = M.styleOps(sh, selRect(), patch);
-  commit(ops, { label: 'Format' });
+  commit(selectionStyleOps(() => patch), { label: 'Format' });
+}
+/** Format cells: a style patch and a border mode (or none) on every selected range, as one change. */
+function formatCells(patch, border) {
+  const sh = sheet();
+  if (!sh || !canEdit()) return;
+  commit(selectionStyleOps((rect) => {
+    const bd = border ? M.borderPatch(rect, border.mode, border.color || null) : null;
+    return (st, r, c, again) => (bd ? { ...patch, ...bd(st, r, c, again) } : patch);
+  }), { label: 'Format cells' });
 }
 function toggleStyle(key) { applyStyle({ [key]: curStyle()[key] ? null : 1 }); }
 function setFormat(fmt) {
@@ -1657,8 +2110,9 @@ function changeDecimals(delta) {
     else if (typeof v === 'number') { const t = numToText(v); cur = t.includes('.') ? Math.min(10, t.split('.')[1].length) : 0; }
     else cur = 0;
   }
-  const dp = Math.max(0, Math.min(10, cur + delta));
-  commit(M.styleOps(sh, selRect(), (s) => ({ dp, nf: s.nf || 'gen' })), { label: 'Decimals' });
+  // up to 15 decimals, as stored (sheet-core.js cleanStyle; Format cells and .xlsx imports can set them)
+  const dp = Math.max(0, Math.min(15, cur + delta));
+  commit(selectionStyleOps(() => (s) => ({ dp, nf: s.nf || 'gen' })), { label: 'Decimals' });
 }
 function numberFormatItems() {
   const sample = (fmt) => { const v = 1234.5678; return formatValue(fmt.nf && ['date', 'ldate', 'dt', 'time'].includes(fmt.nf) ? 46000.5 : v, fmt, LOCALE); };
@@ -1684,7 +2138,8 @@ function numberFormatItems() {
   ];
 }
 function borderItems() {
-  const go = (mode) => () => commit(M.borderOps(sheet(), selRect(), mode, S.borderColor || null), { label: 'Borders' });
+  // with several ranges, each one gets its own borders (outside borders go around each range)
+  const go = (mode) => () => commit(selectionStyleOps((rect) => M.borderPatch(rect, mode, S.borderColor || null)), { label: 'Borders' });
   return [
     { label: 'All borders', action: go('all') }, { label: 'Outside borders', action: go('outer') }, { label: 'Inside borders', action: go('inner') },
     { label: 'Thick outside border', action: go('thick') },
@@ -1706,24 +2161,29 @@ function mergeItems() {
 async function mergeCells(mode) {
   const sh = sheet();
   if (!sh || !canEdit()) return;
-  const rect = expandForMerges(sh, selRect());
+  // with several ranges, each one is merged (or unmerged) on its own, as in Excel
+  const rects = selRects().map((x) => expandForMerges(sh, x));
+  const meets = rectsMeet;
+  if (mode !== 'none' && rangesOverlap(rects)) { toast('Ranges that overlap cannot be merged. Select ranges that do not overlap.', 'error'); return; }
   const x = ix(sh);
-  let merges = sh.merges.filter((m) => { const r = M.objRect(m, x); return r && (r.r2 < rect.r1 || r.r1 > rect.r2 || r.c2 < rect.c1 || r.c1 > rect.c2); });
+  let merges = sh.merges.filter((m) => { const r = M.objRect(m, x); return r && !rects.some((rect) => meets(r, rect)); });
   const ops = [];
   if (mode !== 'none') {
-    const parts = mode === 'across' ? Array.from({ length: rect.r2 - rect.r1 + 1 }, (_, i) => ({ r1: rect.r1 + i, r2: rect.r1 + i, c1: rect.c1, c2: rect.c2 })) : [rect];
     let lost = false;
-    for (const p of parts) {
-      if (p.r1 === p.r2 && p.c1 === p.c2) continue;
-      merges.push(M.rectIds(sh, p));
-      for (let r = p.r1; r <= p.r2; r++) for (let c = p.c1; c <= p.c2; c++) {
-        if (r === p.r1 && c === p.c1) continue;
-        const cell = M.cellAt(sh, r, c);
-        if (cell && cell.v !== undefined) { lost = true; ops.push({ t: 'set', s: sh.id, k: M.keyAt(sh, r, c), v: null }); }
+    for (const rect of rects) {
+      const parts = mode === 'across' ? Array.from({ length: rect.r2 - rect.r1 + 1 }, (_, i) => ({ r1: rect.r1 + i, r2: rect.r1 + i, c1: rect.c1, c2: rect.c2 })) : [rect];
+      for (const p of parts) {
+        if (p.r1 === p.r2 && p.c1 === p.c2) continue;
+        merges.push(M.rectIds(sh, p));
+        for (let r = p.r1; r <= p.r2; r++) for (let c = p.c1; c <= p.c2; c++) {
+          if (r === p.r1 && c === p.c1) continue;
+          const cell = M.cellAt(sh, r, c);
+          if (cell && cell.v !== undefined) { lost = true; ops.push({ t: 'set', s: sh.id, k: M.keyAt(sh, r, c), v: null }); }
+        }
       }
     }
     if (lost && !(await confirmDialog('Merge cells', 'Merging keeps only the value of the top-left cell. The other values will be deleted.', 'Merge'))) return;
-    if (mode === 'center') ops.push(...M.styleOps(sh, { r1: rect.r1, c1: rect.c1, r2: rect.r1, c2: rect.c1 }, { ha: 'center', va: 'middle' }));
+    if (mode === 'center') for (const rect of rects) ops.push(...M.styleOps(sh, { r1: rect.r1, c1: rect.c1, r2: rect.r1, c2: rect.c1 }, { ha: 'center', va: 'middle' }));
   }
   ops.push({ t: 'sheet', s: sh.id, merges });
   commit(ops, { label: mode === 'none' ? 'Unmerge' : 'Merge' });
@@ -1748,17 +2208,16 @@ function clearCells(what = 'values') {
   const sh = sheet();
   if (!sh || !canEdit()) return;
   const ops = [];
-  const s = selRect();
-  for (let r = s.r1; r <= s.r2; r++) for (let c = s.c1; c <= s.c2; c++) {
+  forSelectedCells((r, c) => {
     const k = M.keyAt(sh, r, c);
     const cell = sh.cells[k];
-    if (!cell) continue;
+    if (!cell) return;
     const dv = M.dvFor(sh, r, c, ix(sh));
     if (what === 'values' && cell.v !== undefined) ops.push({ t: 'set', s: sh.id, k, v: dv && dv.type === 'checkbox' ? 'FALSE' : null });
     else if (what === 'formats' && cell.st) ops.push({ t: 'set', s: sh.id, k, st: null });
     else if (what === 'notes' && cell.n) ops.push({ t: 'set', s: sh.id, k, n: null });
     else if (what === 'all') ops.push({ t: 'set', s: sh.id, k, v: null, st: null, n: null });
-  }
+  });
   commit(ops, { label: 'Clear' });
 }
 
@@ -1775,6 +2234,7 @@ function toggleCheckbox(r, c) {
 function structure(kind) {
   const sh = sheet();
   if (!sh || !canEdit()) return;
+  if (oneRange('Inserting and deleting rows and columns')) return;
   const s = selRect();
   const sid = sh.id;
   let axis, at, count;
@@ -1804,10 +2264,9 @@ function structure(kind) {
 function setHidden(axis, hide) {
   const sh = sheet();
   if (!sh || !canEdit()) return;
-  const s = selRect();
+  // the rows (or columns) of every selected range
   const patch = {};
-  if (axis === 'r') for (let r = s.r1; r <= s.r2; r++) patch[sh.rows[r]] = hide ? 1 : null;
-  else for (let c = s.c1; c <= s.c2; c++) patch[sh.cols[c]] = hide ? 1 : null;
+  for (const i of selLines(axis)) patch[(axis === 'r' ? sh.rows : sh.cols)[i]] = hide ? 1 : null;
   if (hide) {
     const list = axis === 'r' ? sh.rows : sh.cols, hidden = axis === 'r' ? sh.hr : sh.hc;
     if (list.every((id) => hidden[id] || patch[id])) { toast('At least one ' + (axis === 'r' ? 'row' : 'column') + ' must stay visible.', 'error'); return; }
@@ -1827,9 +2286,24 @@ function freeze(rows, cols) {
   commit([{ t: 'sheet', s: sh.id, freeze: { r: rows ?? sh.freeze.r, c: cols ?? sh.freeze.c } }], { label: 'Freeze' });
 }
 
-function autoFitColumns(cols) {
+/** Computes the values a fit to the data measures; false (with a message) when the sizes cannot be measured now.
+ * Formulas that need more calculation than the spreadsheet does at once are measured as they show (#CALC!). */
+async function measurable(sh, areas) {
+  const status = await computeValues(areas.map((a) => ({ sheet: sh, ...a })));
+  if (status === 'ok' || status === 'slow') return true;
+  notComputed(status);
+  return false;
+}
+/** Runs of consecutive numbers in a sorted list: [[first, last], …] (rows or columns far apart are separate areas). */
+function runs(list) {
+  const out = [];
+  for (const i of list) { const last = out[out.length - 1]; if (last && i === last[1] + 1) last[1] = i; else out.push([i, i]); }
+  return out;
+}
+async function autoFitColumns(cols) {
   const sh = sheet();
-  if (!sh || !canEdit()) return;
+  if (!sh || !canEdit() || !cols.length) return;
+  if (!(await measurable(sh, runs(cols).map(([c1, c2]) => ({ r1: 0, r2: sh.rows.length - 1, c1, c2 }))))) return;
   const ctx = document.createElement('canvas').getContext('2d');
   const font = getComputedStyle($('grid')).fontFamily;
   const patch = {};
@@ -1848,9 +2322,10 @@ function autoFitColumns(cols) {
   }
   commit([{ t: 'sheet', s: sh.id, colW: patch }], { label: 'Column width' });
 }
-function autoFitRows(rows) {
+async function autoFitRows(rows) {
   const sh = sheet();
-  if (!sh || !canEdit()) return;
+  if (!sh || !canEdit() || !rows.length) return;
+  if (!(await measurable(sh, runs(rows).map(([r1, r2]) => ({ r1, r2, c1: 0, c2: sh.cols.length - 1 }))))) return;
   const ctx = document.createElement('canvas').getContext('2d');
   const font = getComputedStyle($('grid')).fontFamily;
   const patch = {};
@@ -1878,6 +2353,7 @@ function autoFitRows(rows) {
 function autoSum(fn = 'SUM') {
   const sh = sheet();
   if (!sh || !canEdit()) return;
+  if (oneRange('AutoSum')) return;
   const s = selRect();
   // a selected block: put totals under each column
   if (s.r2 > s.r1 || s.c2 > s.c1) {
@@ -1901,19 +2377,26 @@ function autoSum(fn = 'SUM') {
   ed.setSelectionRange(ed.value.length - 1, ed.value.length - 1);
 }
 
-function quickSort(desc) {
+async function quickSort(desc) {
   const sh = sheet();
   if (!sh || !canEdit()) return;
+  if (oneRange('Sorting')) return;
   const x = ix(sh);
-  const t = (sh.tables || []).find((tb) => M.inRect(M.objRect(tb, x), S.sel.r, S.sel.c));
+  const col = S.sel.c;
+  const t = (sh.tables || []).find((tb) => M.inRect(M.objRect(tb, x), S.sel.r, col));
   let rect, header;
   if (t) { const r = M.objRect(t, x); rect = { r1: r.r1, c1: r.c1, r2: r.r2 - (t.totals ? 1 : 0), c2: r.c2 }; header = t.header !== false; }
-  else if (S.sel.r1 === S.sel.r2 && S.sel.c1 === S.sel.c2) {
-    rect = M.currentRegion(sh, S.sel.r, S.sel.c);
-    const first = engine.valueAt(sh, rect.r1, S.sel.c), second = engine.valueAt(sh, rect.r1 + 1, S.sel.c);
-    header = typeof first === 'string' && typeof second !== typeof first || (typeof first === 'string' && (sh.cells[M.keyAt(sh, rect.r1, S.sel.c)] || {}).st?.b);
-  } else { rect = selRect(); header = false; }
-  const ops = M.sortOps(engine, sh, rect, [{ c: S.sel.c, desc }], header);
+  else if (S.sel.r1 === S.sel.r2 && S.sel.c1 === S.sel.c2) rect = M.currentRegion(sh, S.sel.r, col);
+  else { rect = selRect(); header = false; }
+  // the sort column is read once its values are computed (the header guess reads it too)
+  const status = await computeValues([{ sheet: sh, r1: rect.r1, c1: col, r2: rect.r2, c2: col }]);
+  if (status !== 'ok') { notComputed(status); return; }
+  if (header === undefined) {
+    const first = engine.valueAt(sh, rect.r1, col), second = engine.valueAt(sh, rect.r1 + 1, col);
+    header = typeof first === 'string' && typeof second !== typeof first || (typeof first === 'string' && (sh.cells[M.keyAt(sh, rect.r1, col)] || {}).st?.b);
+  }
+  const ops = M.sortOps(engine, sh, rect, [{ c: col, desc }], header);
+  if (!ops) { notComputed('pending'); return; }
   commit(ops, { label: 'Sort' });
 }
 
@@ -1923,6 +2406,7 @@ function toggleFilter() {
   const x = ix(sh);
   const t = (sh.tables || []).find((tb) => M.inRect(M.objRect(tb, x), S.sel.r, S.sel.c));
   if (t) { commit([{ t: 'obj', s: sh.id, kind: 'tables', id: t.id, val: { ...t, filter: t.filter === false, filters: t.filter === false ? t.filters : {} } }], { label: 'Filter' }); return; }
+  if (oneRange('A filter')) return;
   const rect = S.sel.r1 === S.sel.r2 && S.sel.c1 === S.sel.c2 ? M.currentRegion(sh, S.sel.r, S.sel.c) : selRect();
   if (rect.r1 === rect.r2) { toast('Select a range with a header row first.'); return; }
   const id = Core.randomId();
@@ -1931,19 +2415,48 @@ function toggleFilter() {
 
 /* ---- clipboard */
 
+let copyCalc = ''; // the range whose values are being computed for the next copy
+/**
+ * Copies the selection (Ctrl+C, Ctrl+X, Edit > Copy and Cut). The clipboard is filled at once, so a copy cannot wait
+ * for values the work budget left out: then nothing is copied, the values are computed for the next try, and null is
+ * returned. Formulas that need more calculation than the spreadsheet does at once are copied without their values.
+ */
+function copySelection(cut) {
+  const sh = sheet();
+  const rects = selRects().map((x) => expandForMerges(sh, x));
+  // several ranges (as in Excel): no cut; ranges over the same rows or the same columns are copied as one block
+  let lines = null;
+  if (rects.length > 1) {
+    if (cut) { toast('Cut works on one range at a time. Select a single range, or copy the ranges.'); return null; }
+    lines = M.copyLines(rects);
+    if (!lines) { toast('These ranges cannot be copied together. Select ranges over the same rows or the same columns.'); return null; }
+  }
+  const res = lines ? M.copyCells(engine, sh, lines.rows, lines.cols, LOCALE, false) : M.copyRect(engine, sh, rects[0], LOCALE, cut);
+  if (res.pending) {
+    toast('Some values are still being calculated. Copy again in a moment.');
+    const key = S.version + '|' + sh.id + '|' + rects.map((x) => M.rectText(x)).join(',');
+    if (copyCalc !== key) {
+      copyCalc = key;
+      computeValues(rects.map((x) => ({ sheet: sh, ...x })), { quiet: true }).catch(() => null).then(() => { if (copyCalc === key) copyCalc = ''; });
+    }
+    return null;
+  }
+  if (res.slow) toast('Some formulas need more calculation than the spreadsheet does at once, so their values were left out of the copy.');
+  S.clip = { text: res.text, html: res.html };
+  S.ants = { sheetId: sh.id, rect: rects[rects.length - 1], rects, cut: !!cut && canEdit() };
+  renderGrid();
+  return res;
+}
 function onCopy(e, cut) {
   if (isTextTarget(e.target)) return;
   const sh = sheet();
   if (!sh || S.editing) return;
   if (S.chartSel) return;
   e.preventDefault();
-  const rect = expandForMerges(sh, selRect());
-  const res = M.copyRect(engine, sh, rect, LOCALE, cut);
+  const res = copySelection(cut);
+  if (!res) return;
   e.clipboardData.setData('text/plain', res.text);
   e.clipboardData.setData('text/html', res.html);
-  S.clip = { text: res.text, html: res.html };
-  S.ants = { sheetId: sh.id, rect, cut: !!cut && canEdit() };
-  renderGrid();
 }
 function onPaste(e) {
   if (isTextTarget(e.target)) return;
@@ -1955,9 +2468,43 @@ function onPaste(e) {
   pasteData(html, text, S.pasteMode || 'all');
   S.pasteMode = null;
 }
-function pasteData(html, text, mode, transpose) {
+/** Computes the values of copied formulas that paste special > Values reads; false (with a message) when it cannot. */
+async function clipComputed(clip) {
+  const src = view().sheets.find((s) => s.id === clip.src.sheetId);
+  if (!src || !clip.rows.length) return true; // no values to read
+  // the copied cells: runs of their rows by runs of their columns (a copy of several ranges, or one that left hidden
+  // rows out, is not one rectangle)
+  const rows = runs(Array.isArray(clip.src.rows) ? clip.src.rows : range(clip.src.r1, clip.src.r1 + clip.rows.length - 1));
+  const cols = runs(Array.isArray(clip.src.cols) ? clip.src.cols : range(clip.src.c1, clip.src.c1 + clip.rows[0].length - 1));
+  const status = await computeValues(rows.flatMap(([r1, r2]) => cols.map(([c1, c2]) => ({ sheet: src, r1, c1, r2, c2 }))));
+  if (status === 'ok') return true;
+  notComputed(status);
+  return false;
+}
+const tooMuchToPaste = () => toast('This is too much to paste at once (at most ' + Core.LIMITS.opsPerBatch.toLocaleString(LOCALE) + ' cells).', 'error');
+/** Paste with several ranges selected: one copied cell goes into every selected cell, as in Excel; more cannot. */
+async function pasteIntoRanges(data, mode, transpose, label) {
   const sh = sheet();
+  const rects = selRects();
+  if (!(data.rows.length === 1 && data.rows[0] && data.rows[0].length === 1)) { toast('Only a single copied cell can be pasted into several ranges. Select a single range to paste into.'); return; }
+  if (data.cut && data === M.getInternalClip()) { toast('Cut cells can be pasted into a single range only. Select a single range to paste into.'); return; }
+  if (mode === 'values' && data.src && !(await clipComputed(data))) return;
+  const sets = new Map(), other = [];
+  for (const rect of rects) {
+    const ops = M.pasteOps(engine, view(), sh, rect, data, { mode, transpose, locale: LOCALE });
+    if (ops === false) { notComputed('pending'); return; }
+    if (!ops) { tooMuchToPaste(); return; }
+    for (const op of ops) { if (op.t === 'set') sets.set(op.k, op); else other.push(op); }
+    // over one batch of changes: stop at once (a cell in several ranges counts once)
+    if (sets.size + other.length > Core.LIMITS.opsPerBatch) { tooMuchToPaste(); return; }
+  }
+  commit([...other, ...sets.values()], { label, keepAnts: true });
+}
+async function pasteData(html, text, mode, transpose) {
+  const sh = sheet();
+  const tooBig = tooMuchToPaste;
   const parsed = M.parseClipboardHtml(html);
+  if (parsed && parsed.tooBig) { tooBig(); return; }
   let data = null;
   if (parsed && parsed.ours) data = parsed.ours;
   else if (parsed && parsed.rows && parsed.rows.length) data = { rows: parsed.rows };
@@ -1966,8 +2513,13 @@ function pasteData(html, text, mode, transpose) {
     data = { rows: rows.map((r) => r.map((t) => ({ text: t, st: null }))) };
   }
   if (!data) return;
+  if (multiSel()) { await pasteIntoRanges(data, mode, transpose, 'Paste'); return; }
   const target = selRect();
+  // pasted values of copied formulas are read now: computed first
+  if (mode === 'values' && data.src && !(await clipComputed(data))) return;
   const ops = M.pasteOps(engine, view(), sh, target, data, { mode, transpose, locale: LOCALE });
+  if (ops === false) { notComputed('pending'); return; }
+  if (!ops) { tooBig(); return; }
   if (data === M.getInternalClip() && data.cut && mode === 'all') {
     ops.push(...M.cutClearOps(view(), data, sh.id, target));
     M.clearInternalClip();
@@ -1987,8 +2539,13 @@ async function pasteSpecial(mode, transpose) {
   if (!canEdit()) return;
   const clip = M.getInternalClip();
   if (clip) {
+    if (multiSel()) { await pasteIntoRanges(clip, mode, transpose, 'Paste special'); return; }
     const sh = sheet();
-    const ops = M.pasteOps(engine, view(), sh, selRect(), clip, { mode, transpose, locale: LOCALE });
+    const target = selRect();
+    if (mode === 'values' && !(await clipComputed(clip))) return;
+    const ops = M.pasteOps(engine, view(), sh, target, clip, { mode, transpose, locale: LOCALE });
+    if (ops === false) { notComputed('pending'); return; }
+    if (!ops) { tooMuchToPaste(); return; }
     commit(ops, { label: 'Paste special', keepAnts: true });
     return;
   }
@@ -2030,13 +2587,9 @@ async function clipboardAction(kind) {
     }
     return;
   }
-  const sh = sheet();
-  const rect = expandForMerges(sh, selRect());
-  const res = M.copyRect(engine, sh, rect, LOCALE, kind === 'cut');
   // copied for this spreadsheet in any case; the system clipboard (other apps) only when the browser allows it
-  S.clip = { text: res.text, html: res.html };
-  S.ants = { sheetId: sh.id, rect, cut: kind === 'cut' && canEdit() };
-  renderGrid();
+  const res = copySelection(kind === 'cut');
+  if (!res) return;
   try {
     await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob([res.text], { type: 'text/plain' }), 'text/html': new Blob([res.html], { type: 'text/html' }) })]);
   } catch (e) {
@@ -2062,29 +2615,41 @@ function fillTo(dest, copyOnly) {
   if (commit(M.fillOps(sh, src, area, dir, copyOnly), { label: 'Fill' })) selectRect({ r1: Math.min(src.r1, dest.r1), c1: Math.min(src.c1, dest.c1), r2: Math.max(src.r2, dest.r2), c2: Math.max(src.c2, dest.c2) }, { r: S.sel.r, c: S.sel.c });
 }
 function fillDirection(dir) {
-  const s = selRect();
   const sh = sheet();
-  if (dir === 'down') {
-    if (s.r1 === s.r2) { if (s.r1 === 0) return; commit(M.fillOps(sh, { ...s, r1: s.r1 - 1, r2: s.r1 - 1 }, s, 'down', true), { label: 'Fill down' }); }
-    else commit(M.fillOps(sh, { ...s, r2: s.r1 }, { ...s, r1: s.r1 + 1 }, 'down', true), { label: 'Fill down' });
-  } else {
-    if (s.c1 === s.c2) { if (s.c1 === 0) return; commit(M.fillOps(sh, { ...s, c1: s.c1 - 1, c2: s.c1 - 1 }, s, 'right', true), { label: 'Fill right' }); }
-    else commit(M.fillOps(sh, { ...s, c2: s.c1 }, { ...s, c1: s.c1 + 1 }, 'right', true), { label: 'Fill right' });
-  }
+  // Ctrl+D, Ctrl+R: each selected range is filled from its own first row (column), or from the one above (left of) a
+  // single row (column)
+  const fill = (s) => {
+    if (dir === 'down') {
+      if (s.r1 === s.r2) return s.r1 === 0 ? [] : M.fillOps(sh, { ...s, r1: s.r1 - 1, r2: s.r1 - 1 }, s, 'down', true);
+      return M.fillOps(sh, { ...s, r2: s.r1 }, { ...s, r1: s.r1 + 1 }, 'down', true);
+    }
+    if (s.c1 === s.c2) return s.c1 === 0 ? [] : M.fillOps(sh, { ...s, c1: s.c1 - 1, c2: s.c1 - 1 }, s, 'right', true);
+    return M.fillOps(sh, { ...s, c2: s.c1 }, { ...s, c1: s.c1 + 1 }, 'right', true);
+  };
+  // each range is filled from the sheet as it is: ranges that share cells, or where one is filled from a cell of
+  // another (a single row reads the row above it, a single column the column left of it), would mix old and new values
+  const rects = selRects();
+  // (a single row in row 1, or a single column in column A, is not filled: it neither reads nor writes)
+  const reach = (s) => (dir === 'down' ? (s.r1 !== s.r2 ? s : s.r1 > 0 ? { ...s, r1: s.r1 - 1 } : null) : (s.c1 !== s.c2 ? s : s.c1 > 0 ? { ...s, c1: s.c1 - 1 } : null));
+  if (rangesOverlap(rects.map(reach).filter(Boolean))) { toast('These ranges cannot be filled together: they overlap, or one is filled from cells of another. Fill them one at a time.', 'error'); return; }
+  const ops = rects.flatMap(fill);
+  if (ops.length) commit(ops, { label: dir === 'down' ? 'Fill down' : 'Fill right' });
 }
 
 /* ================================================================ mouse */
 
+/* A merge drawn clipped (renderGrid) starts at a later row than its own: data-mr is the merge's first row, whose cell
+ * a click on it is about. */
 function cellFromEvent(e) {
   const td = e.target.closest && e.target.closest('td[data-r]');
   if (!td) return null;
-  return { r: +td.dataset.r, c: +td.dataset.c, td };
+  return { r: +(td.dataset.mr ?? td.dataset.r), c: +td.dataset.c, td };
 }
 /** Cell under a point, also outside the rendered cells (for drag selection). */
 function cellAtPoint(x, y) {
   const el = document.elementFromPoint(x, y);
   const td = el && el.closest && el.closest('td[data-r]');
-  if (td) return { r: +td.dataset.r, c: +td.dataset.c };
+  if (td) return { r: +(td.dataset.mr ?? td.dataset.r), c: +td.dataset.c };
   const L = layout();
   const wrap = $('gridWrap').getBoundingClientRect();
   const sx = x - wrap.left + $('gridWrap').scrollLeft - L.rhW, sy = y - wrap.top + $('gridWrap').scrollTop - L.hdrH - L.frozenH + L.rowTop[L.fr];
@@ -2097,15 +2662,18 @@ function cellAtPoint(x, y) {
 let drag = null;
 let lastCellDown = null; // { r, c, sheetId, t, x, y } of the last click on a cell, to recognise a double-click
 function onGridMouseDown(e) {
-  if (e.button === 2) return;
+  // a right-click (and a Ctrl+click on a Mac, which is one there) is handled by onGridContextMenu
+  if (e.button === 2 || (IS_MAC && e.ctrlKey && !e.metaKey)) return;
   const t = e.target;
   // charts
   const chartEl = t.closest && t.closest('.chart');
   if (chartEl) { chartMouseDown(e, chartEl); return; }
   const fltBtn = t.closest && t.closest('[data-flt]');
   if (fltBtn) { e.preventDefault(); if (S.editing) commitEdit(); D.filterPopover(A, fltBtn.dataset.flt, +fltBtn.dataset.fc, fltBtn.getBoundingClientRect()); return; }
-  if (t.closest && t.closest('[data-dv]')) { e.preventDefault(); openListPicker(); return; }
-  if (t.closest && t.closest('[data-cbx]')) {
+  // Ctrl+click (Cmd+click on a Mac) adds the cell to the selection: on a list arrow or a checkbox too
+  const adding = (IS_MAC ? e.metaKey : e.ctrlKey) && !e.shiftKey && !e.altKey;
+  if (!adding && t.closest && t.closest('[data-dv]')) { e.preventDefault(); openListPicker(); return; }
+  if (!adding && t.closest && t.closest('[data-cbx]')) {
     const cc = cellFromEvent(e);
     if (cc) { e.preventDefault(); selectCell(cc.r, cc.c); toggleCheckbox(cc.r, cc.c); focusGrid(); }
     return;
@@ -2126,15 +2694,22 @@ function onGridMouseDown(e) {
     }
     if (S.editing) commitEdit();
     if (th.dataset.corner) { selectRect({ r1: 0, c1: 0, r2: sh.rows.length - 1, c2: sh.cols.length - 1 }, { r: S.sel.r, c: S.sel.c }); focusGrid(); return; }
+    // Ctrl+click adds whole columns (rows) to the selection; Shift+click extends the range selected last
     if (th.dataset.ch !== undefined) {
       const c = +th.dataset.ch;
       const from = e.shiftKey ? S.sel.c : c;
-      selectRect({ r1: 0, r2: sh.rows.length - 1, c1: Math.min(from, c), c2: Math.max(from, c) }, { r: firstVisibleRow(), c: from });
+      const rect = { r1: 0, r2: sh.rows.length - 1, c1: Math.min(from, c), c2: Math.max(from, c) };
+      if (adding) { if (!addRange(rect, { r: firstVisibleRow(), c })) return; }
+      else if (e.shiftKey) setActiveRange(rect, { r: firstVisibleRow(), c: from });
+      else selectRect(rect, { r: firstVisibleRow(), c: from });
       drag = { kind: 'cols', from };
     } else if (th.dataset.rh !== undefined) {
       const r = +th.dataset.rh;
       const from = e.shiftKey ? S.sel.r : r;
-      selectRect({ c1: 0, c2: sh.cols.length - 1, r1: Math.min(from, r), r2: Math.max(from, r) }, { r: from, c: 0 });
+      const rect = { c1: 0, c2: sh.cols.length - 1, r1: Math.min(from, r), r2: Math.max(from, r) };
+      if (adding) { if (!addRange(rect, { r, c: 0 })) return; }
+      else if (e.shiftKey) setActiveRange(rect, { r: from, c: 0 });
+      else selectRect(rect, { r: from, c: 0 });
       drag = { kind: 'rows', from };
     }
     focusGrid();
@@ -2167,6 +2742,7 @@ function onGridMouseDown(e) {
     if (!commitEdit()) return;
   }
   if (e.shiftKey) selectCell(hit.r, hit.c, true);
+  else if (adding) { S.tabStart = null; if (!addRange({ r1: hit.r, c1: hit.c, r2: hit.r, c2: hit.c }, { r: hit.r, c: hit.c })) return; }
   else selectCell(hit.r, hit.c);
   drag = { kind: 'cells' };
   S.painterDragging = !!S.painter;
@@ -2184,9 +2760,10 @@ function onMouseMove(e) {
   if (drag.kind === 'cells') {
     if (p.r !== drag.lr || p.c !== drag.lc) { drag.lr = p.r; drag.lc = p.c; selectCell(p.r, p.c, true); }
   } else if (drag.kind === 'cols') {
-    selectRect({ r1: 0, r2: sh.rows.length - 1, c1: Math.min(drag.from, p.c), c2: Math.max(drag.from, p.c) }, { r: S.sel.r, c: drag.from });
+    // the range being dragged is the active one; ranges selected before it with Ctrl stay
+    setActiveRange({ r1: 0, r2: sh.rows.length - 1, c1: Math.min(drag.from, p.c), c2: Math.max(drag.from, p.c) }, { r: S.sel.r, c: drag.from });
   } else if (drag.kind === 'rows') {
-    selectRect({ c1: 0, c2: sh.cols.length - 1, r1: Math.min(drag.from, p.r), r2: Math.max(drag.from, p.r) }, { r: drag.from, c: 0 });
+    setActiveRange({ c1: 0, c2: sh.cols.length - 1, r1: Math.min(drag.from, p.r), r2: Math.max(drag.from, p.r) }, { r: drag.from, c: 0 });
   } else if (drag.kind === 'ref') {
     if (p.r !== drag.lr || p.c !== drag.lc) { drag.lr = p.r; drag.lc = p.c; insertRef(drag.r, drag.c, p.r, p.c, true); }
   } else if (drag.kind === 'fill') {
@@ -2223,11 +2800,9 @@ function onMouseUp(e) {
     $('resizeGuide').hidden = true;
     if (d.newSize && d.newSize !== Math.round(d.size / layout().z)) {
       const sh = sheet();
-      const s = selRect();
       const patch = {};
-      const full = d.axis === 'c' ? s.r1 === 0 && s.r2 === sh.rows.length - 1 && d.index >= s.c1 && d.index <= s.c2 : s.c1 === 0 && s.c2 === sh.cols.length - 1 && d.index >= s.r1 && d.index <= s.r2;
-      const range = full ? (d.axis === 'c' ? [s.c1, s.c2] : [s.r1, s.r2]) : [d.index, d.index];
-      for (let i = range[0]; i <= range[1]; i++) patch[(d.axis === 'c' ? sh.cols : sh.rows)[i]] = d.newSize;
+      // a selected whole column (row): every selected whole column (row) gets the size, also of other ranges
+      for (const i of wholeLinesAt(d.axis, d.index)) patch[(d.axis === 'c' ? sh.cols : sh.rows)[i]] = d.newSize;
       commit([{ t: 'sheet', s: sh.id, [d.axis === 'c' ? 'colW' : 'rowH']: patch }], { label: 'Resize' });
     }
   }
@@ -2268,18 +2843,8 @@ function startResize(e, axis, index) {
 
 function onGridDblClick(e) {
   const t = e.target;
-  if (t.dataset && t.dataset.cres !== undefined) {
-    const s = selRect(), sh = sheet(), c = +t.dataset.cres;
-    const full = s.r1 === 0 && s.r2 === sh.rows.length - 1 && c >= s.c1 && c <= s.c2;
-    autoFitColumns(full ? Array.from({ length: s.c2 - s.c1 + 1 }, (_, i) => s.c1 + i) : [c]);
-    return;
-  }
-  if (t.dataset && t.dataset.rres !== undefined) {
-    const s = selRect(), sh = sheet(), r = +t.dataset.rres;
-    const full = s.c1 === 0 && s.c2 === sh.cols.length - 1 && r >= s.r1 && r <= s.r2;
-    autoFitRows(full ? Array.from({ length: s.r2 - s.r1 + 1 }, (_, i) => s.r1 + i) : [r]);
-    return;
-  }
+  if (t.dataset && t.dataset.cres !== undefined) { autoFitColumns(wholeLinesAt('c', +t.dataset.cres)); return; }
+  if (t.dataset && t.dataset.rres !== undefined) { autoFitRows(wholeLinesAt('r', +t.dataset.rres)); return; }
   const chartEl = t.closest && t.closest('.chart');
   if (chartEl) { if (canEdit()) D.chartDialog(A, chartEl.dataset.chart); return; }
   if (t.dataset && t.dataset.fill) {
@@ -2304,9 +2869,11 @@ function onGridContextMenu(e) {
   const th = t.closest('th');
   const hit = cellFromEvent(e);
   const sh = sheet();
-  if (hit && !M.inRect(selRect(), hit.r, hit.c)) selectCell(hit.r, hit.c);
-  if (th && th.dataset.ch !== undefined && !(S.sel.r1 === 0 && S.sel.r2 === sh.rows.length - 1 && +th.dataset.ch >= S.sel.c1 && +th.dataset.ch <= S.sel.c2)) selectRect({ r1: 0, r2: sh.rows.length - 1, c1: +th.dataset.ch, c2: +th.dataset.ch });
-  if (th && th.dataset.rh !== undefined && !(S.sel.c1 === 0 && S.sel.c2 === sh.cols.length - 1 && +th.dataset.rh >= S.sel.r1 && +th.dataset.rh <= S.sel.r2)) selectRect({ c1: 0, c2: sh.cols.length - 1, r1: +th.dataset.rh, r2: +th.dataset.rh });
+  // a right-click inside the selection (any of its ranges) keeps it
+  const rects = selRects();
+  if (hit && !rects.some((x) => M.inRect(x, hit.r, hit.c))) selectCell(hit.r, hit.c);
+  if (th && th.dataset.ch !== undefined && !rects.some((x) => x.r1 === 0 && x.r2 === sh.rows.length - 1 && +th.dataset.ch >= x.c1 && +th.dataset.ch <= x.c2)) selectRect({ r1: 0, r2: sh.rows.length - 1, c1: +th.dataset.ch, c2: +th.dataset.ch });
+  if (th && th.dataset.rh !== undefined && !rects.some((x) => x.c1 === 0 && x.c2 === sh.cols.length - 1 && +th.dataset.rh >= x.r1 && +th.dataset.rh <= x.r2)) selectRect({ c1: 0, c2: sh.cols.length - 1, r1: +th.dataset.rh, r2: +th.dataset.rh });
   const pt = { left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY };
   menu(contextItems(th ? (th.dataset.ch !== undefined ? 'col' : th.dataset.rh !== undefined ? 'row' : 'cell') : 'cell'), pt, { onDone: () => focusGrid(), hideDisabled: !canEdit() });
 }
@@ -2318,38 +2885,44 @@ function contextItems(kind) {
   const sh = sheet();
   const cell = M.cellAt(sh, S.sel.r, S.sel.c);
   const items = [
-    { label: 'Cut', kbd: 'Ctrl+X', icon: null, action: () => clipboardAction('cut'), disabled: ro },
-    { label: 'Copy', kbd: 'Ctrl+C', action: () => clipboardAction('copy') },
-    { label: 'Paste', kbd: 'Ctrl+V', action: () => clipboardAction('paste'), disabled: ro },
-    { label: 'Paste special', disabled: ro, sub: [
-      { label: 'Values only', kbd: 'Ctrl+Shift+V', action: () => pasteSpecial('values') },
-      { label: 'Formulas only', action: () => pasteSpecial('formulas') },
-      { label: 'Formatting only', action: () => pasteSpecial('formats') },
-      { label: 'Transposed', action: () => pasteSpecial('all', true) }] },
+    { label: 'Cut', kbd: 'Ctrl+X', icon: 'cut', action: () => clipboardAction('cut'), disabled: ro },
+    { label: 'Copy', kbd: 'Ctrl+C', icon: 'copy', action: () => clipboardAction('copy') },
+    { label: 'Paste', kbd: 'Ctrl+V', icon: 'paste', action: () => clipboardAction('paste'), disabled: ro },
+    { label: 'Paste special', icon: 'pasteSpecial', disabled: ro, sub: pasteSpecialItems(true) },
     '-'
   ];
   // inserting and deleting rows and columns are submenus, so that the menu fits a small frame
   const ins = [], del = [];
-  if (kind !== 'col') ins.push({ label: `${nR === 1 ? 'Row' : nR + ' rows'} above`, action: () => structure('rowAbove') }, { label: `${nR === 1 ? 'Row' : nR + ' rows'} below`, action: () => structure('rowBelow') });
-  if (kind !== 'row') ins.push({ label: `${nC === 1 ? 'Column' : nC + ' columns'} left`, action: () => structure('colLeft') }, { label: `${nC === 1 ? 'Column' : nC + ' columns'} right`, action: () => structure('colRight') });
-  if (kind !== 'col') del.push({ label: nR === 1 ? 'Row ' + (s.r1 + 1) : 'Rows ' + (s.r1 + 1) + '–' + (s.r2 + 1), action: () => structure('delRows') });
-  if (kind !== 'row') del.push({ label: nC === 1 ? 'Column ' + colName(s.c1) : 'Columns ' + colName(s.c1) + '–' + colName(s.c2), action: () => structure('delCols') });
-  items.push({ label: 'Insert', sub: ins, disabled: ro }, { label: 'Delete', sub: del, disabled: ro });
+  if (kind !== 'col') ins.push({ label: `${nR === 1 ? 'Row' : nR + ' rows'} above`, icon: 'rowAbove', action: () => structure('rowAbove') }, { label: `${nR === 1 ? 'Row' : nR + ' rows'} below`, icon: 'rowBelow', action: () => structure('rowBelow') });
+  if (kind !== 'row') ins.push({ label: `${nC === 1 ? 'Column' : nC + ' columns'} left`, icon: 'colLeft', action: () => structure('colLeft') }, { label: `${nC === 1 ? 'Column' : nC + ' columns'} right`, icon: 'colRight', action: () => structure('colRight') });
+  if (kind !== 'col') del.push({ label: nR === 1 ? 'Row ' + (s.r1 + 1) : 'Rows ' + (s.r1 + 1) + '–' + (s.r2 + 1), icon: 'delRow', action: () => structure('delRows') });
+  if (kind !== 'row') del.push({ label: nC === 1 ? 'Column ' + colName(s.c1) : 'Columns ' + colName(s.c1) + '–' + colName(s.c2), icon: 'delCol', action: () => structure('delCols') });
+  items.push({ label: 'Insert', icon: 'insert', sub: ins, disabled: ro }, { label: 'Delete', icon: 'remove', sub: del, disabled: ro });
   items.push('-');
-  if (kind === 'row') items.push({ label: 'Hide rows', action: () => setHidden('r', true), disabled: ro }, { label: 'Unhide rows', action: () => unhideAll('r'), disabled: ro }, { label: 'Row height…', action: () => D.sizeDialog(A, 'r'), disabled: ro }, { label: 'Fit to data', action: () => autoFitRows(range(s.r1, s.r2)), disabled: ro }, '-');
-  if (kind === 'col') items.push({ label: 'Hide columns', action: () => setHidden('c', true), disabled: ro }, { label: 'Unhide columns', action: () => unhideAll('c'), disabled: ro }, { label: 'Column width…', action: () => D.sizeDialog(A, 'c'), disabled: ro }, { label: 'Fit to data', action: () => autoFitColumns(range(s.c1, s.c2)), disabled: ro }, '-');
+  // hiding, sizes and fitting act on the rows (columns) of every selected range
+  if (kind === 'row') items.push({ label: 'Hide rows', icon: 'eyeOff', action: () => setHidden('r', true), disabled: ro }, { label: 'Unhide rows', icon: 'eye', action: () => unhideAll('r'), disabled: ro }, { label: 'Row height…', icon: 'rowHeight', action: () => D.sizeDialog(A, 'r'), disabled: ro }, { label: 'Fit to data', icon: 'fitRows', action: () => autoFitRows(selLines('r')), disabled: ro }, '-');
+  if (kind === 'col') items.push({ label: 'Hide columns', icon: 'eyeOff', action: () => setHidden('c', true), disabled: ro }, { label: 'Unhide columns', icon: 'eye', action: () => unhideAll('c'), disabled: ro }, { label: 'Column width…', icon: 'colWidth', action: () => D.sizeDialog(A, 'c'), disabled: ro }, { label: 'Fit to data', icon: 'fitCols', action: () => autoFitColumns(selLines('c')), disabled: ro }, '-');
   items.push(
-    { label: 'Clear contents', kbd: 'Delete', action: () => clearCells('values'), disabled: ro },
-    { label: 'Clear formatting', action: () => clearCells('formats'), disabled: ro },
+    { label: 'Clear contents', kbd: 'Delete', icon: 'clearContents', action: () => clearCells('values'), disabled: ro },
+    { label: 'Clear formatting', icon: 'clear', action: () => clearCells('formats'), disabled: ro },
     '-',
-    { label: 'Sort A → Z', action: () => quickSort(false), disabled: ro },
-    { label: 'Sort Z → A', action: () => quickSort(true), disabled: ro },
-    { label: cell && cell.n ? 'Edit note' : 'Insert note', kbd: 'Shift+F2', action: () => D.noteDialog(A), disabled: ro },
-    { label: 'Data validation…', action: () => D.dvDialog(A), disabled: ro },
-    { label: 'Conditional formatting…', action: () => D.cfDialog(A), disabled: ro },
-    { label: 'Define named range…', action: () => D.namesDialog(A, true), disabled: ro }
+    { label: 'Sort A → Z', icon: 'sortAsc', action: () => quickSort(false), disabled: ro },
+    { label: 'Sort Z → A', icon: 'sortDesc', action: () => quickSort(true), disabled: ro },
+    { label: cell && cell.n ? 'Edit note' : 'Insert note', kbd: 'Shift+F2', icon: 'note', action: () => D.noteDialog(A), disabled: ro },
+    { label: 'Format cells…', icon: 'formatCells', action: () => D.formatCellsDialog(A), disabled: ro },
+    { label: 'Data validation…', icon: 'validation', action: () => D.dvDialog(A), disabled: ro },
+    { label: 'Conditional formatting…', icon: 'cf', action: () => D.cfDialog(A), disabled: ro },
+    { label: 'Define named range…', icon: 'tag', action: () => D.namesDialog(A, true), disabled: ro }
   );
   return items;
+}
+/** The kinds of Paste special (the context menu and the Edit menu). */
+function pasteSpecialItems(withKbd) {
+  return [
+    { label: 'Values only', kbd: withKbd ? 'Ctrl+Shift+V' : '', icon: 'values', action: () => pasteSpecial('values') },
+    { label: 'Formulas only', icon: 'fx', action: () => pasteSpecial('formulas') },
+    { label: 'Formatting only', icon: 'paint', action: () => pasteSpecial('formats') },
+    { label: 'Transposed', icon: 'transpose', action: () => pasteSpecial('all', true) }];
 }
 const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
 
@@ -2406,7 +2979,7 @@ function openListPicker() {
   const dv = M.dvFor(sh, S.sel.r, S.sel.c, ix(sh));
   if (!dv || dv.type !== 'list' || !canEdit()) return;
   const items = M.listItems(engine, view(), sh, dv, LOCALE);
-  const td = $('grid').querySelector(`td[data-r="${S.sel.r}"][data-c="${S.sel.c}"]`);
+  const td = cellTd(S.sel.r, S.sel.c);
   if (!td) return;
   const current = formatValue(engine.valueAt(sh, S.sel.r, S.sel.c), (M.cellAt(sh, S.sel.r, S.sel.c) || {}).st, LOCALE);
   const search = h('input', { class: 'input small', placeholder: 'Search', 'aria-label': 'Search' });
@@ -2473,7 +3046,8 @@ function onGridKey(e) {
       else startEdit(formatValue(Math.floor(engine.evalAt('=TODAY()', sh, 0, 0)), { nf: 'date' }, LOCALE), 'edit');
       return;
     }
-    if (key === ' ') { e.preventDefault(); selectRect({ r1: 0, r2: sh.rows.length - 1, c1: s.c1, c2: s.c2 }, { r: s.r, c: s.c }); return; }
+    // Ctrl+Space: the whole columns of the selected ranges
+    if (key === ' ') { e.preventDefault(); mapRanges((x) => ({ ...x, r1: 0, r2: sh.rows.length - 1 })); return; }
     if (key === '-' ) { e.preventDefault(); if (s.c1 === 0 && s.c2 === sh.cols.length - 1) structure('delRows'); else if (s.r1 === 0 && s.r2 === sh.rows.length - 1) structure('delCols'); return; }
     if (key === '+' || key === '=' && e.shiftKey) { e.preventDefault(); if (s.c1 === 0 && s.c2 === sh.cols.length - 1) structure('rowAbove'); else if (s.r1 === 0 && s.r2 === sh.rows.length - 1) structure('colLeft'); return; }
     if (key === 'PageDown' || key === 'PageUp') { e.preventDefault(); const i = view().sheets.findIndex((x) => x.id === sh.id); const n = view().sheets[i + (key === 'PageDown' ? 1 : -1)]; if (n) goToSheet(n.id); return; }
@@ -2494,7 +3068,8 @@ function onGridKey(e) {
       const end = { r: s.r === s.r1 ? s.r2 : s.r1, c: s.c === s.c1 ? s.c2 : s.c1 };
       const [r, c] = ctrl ? jump(end.r, end.c, dr, dc) : step(end.r, end.c, dr, dc);
       const R = expandForMerges(sh, { r1: Math.min(s.r, r), c1: Math.min(s.c, c), r2: Math.max(s.r, r), c2: Math.max(s.c, c) });
-      S.sel = { r: s.r, c: s.c, ...R };
+      // the active range changes; the other selected ranges stay (as they are now: moving past the end grew the sheet)
+      S.sel = { r: s.r, c: s.c, ...R, ...(S.sel.more ? { more: S.sel.more } : {}) };
       afterSelection();
       scrollIntoView(r, c);
     } else {
@@ -2506,13 +3081,13 @@ function onGridKey(e) {
   }
   if (key === 'Tab') {
     e.preventDefault();
-    if (s.r1 !== s.r2 || s.c1 !== s.c2) moveWithinSelection(0, e.shiftKey ? -1 : 1);
+    if (multiSel() || s.r1 !== s.r2 || s.c1 !== s.c2) moveWithinSelection(0, e.shiftKey ? -1 : 1);
     else { if (S.tabStart === null) S.tabStart = s.c; const [r, c] = step(s.r, s.c, 0, e.shiftKey ? -1 : 1); selectCell(r, c, false, true); scrollIntoView(r, c); }
     return;
   }
   if (key === 'Enter') {
     e.preventDefault();
-    if (s.r1 !== s.r2 || s.c1 !== s.c2) moveWithinSelection(e.shiftKey ? -1 : 1, 0);
+    if (multiSel() || s.r1 !== s.r2 || s.c1 !== s.c2) moveWithinSelection(e.shiftKey ? -1 : 1, 0);
     else {
       const base = !e.shiftKey && S.tabStart !== null ? S.tabStart : s.c;
       const [r, c] = step(s.r, base, e.shiftKey ? -1 : 1, 0);
@@ -2534,7 +3109,8 @@ function onGridKey(e) {
   if (key === 'Delete' || key === 'Backspace') { e.preventDefault(); clearCells('values'); return; }
   if (key === 'F2') { e.preventDefault(); startEdit(null, 'edit'); return; }
   if (key === 'Escape') { if (S.ants) { S.ants = null; M.clearInternalClip(); renderGrid(); } if (S.painter) { S.painter = null; renderToolbarState(); } return; }
-  if (key === ' ' && e.shiftKey) { e.preventDefault(); selectRect({ c1: 0, c2: sh.cols.length - 1, r1: s.r1, r2: s.r2 }, { r: s.r, c: s.c }); return; }
+  // Shift+Space: the whole rows of the selected ranges
+  if (key === ' ' && e.shiftKey) { e.preventDefault(); mapRanges((x) => ({ ...x, c1: 0, c2: sh.cols.length - 1 })); return; }
   if (key === ' ' && !ctrl) {
     const dv = M.dvFor(sh, s.r, s.c, ix(sh));
     if (dv && dv.type === 'checkbox') { e.preventDefault(); toggleCheckbox(s.r, s.c); return; }
@@ -2653,20 +3229,18 @@ function buildMenubar() {
       { label: 'Undo', kbd: 'Ctrl+Z', icon: 'undo', action: () => undoRedo(false), disabled: ro || !S.undo.length },
       { label: 'Redo', kbd: 'Ctrl+Y', icon: 'redo', action: () => undoRedo(true), disabled: ro || !S.redo.length },
       '-',
-      { label: 'Cut', kbd: 'Ctrl+X', action: () => clipboardAction('cut'), disabled: ro },
-      { label: 'Copy', kbd: 'Ctrl+C', action: () => clipboardAction('copy') },
-      { label: 'Paste', kbd: 'Ctrl+V', action: () => clipboardAction('paste'), disabled: ro },
-      { label: 'Paste special', disabled: ro, sub: [
-        { label: 'Values only', action: () => pasteSpecial('values') }, { label: 'Formulas only', action: () => pasteSpecial('formulas') },
-        { label: 'Formatting only', action: () => pasteSpecial('formats') }, { label: 'Transposed', action: () => pasteSpecial('all', true) }] },
+      { label: 'Cut', kbd: 'Ctrl+X', icon: 'cut', action: () => clipboardAction('cut'), disabled: ro },
+      { label: 'Copy', kbd: 'Ctrl+C', icon: 'copy', action: () => clipboardAction('copy') },
+      { label: 'Paste', kbd: 'Ctrl+V', icon: 'paste', action: () => clipboardAction('paste'), disabled: ro },
+      { label: 'Paste special', icon: 'pasteSpecial', disabled: ro, sub: pasteSpecialItems(false) },
       '-',
       { label: ro ? 'Find' : 'Find and replace', kbd: ro ? 'Ctrl+F' : 'Ctrl+H', icon: 'search', action: () => D.findDialog(A, canEdit()) },
       { label: 'Fill down', kbd: 'Ctrl+D', action: () => fillDirection('down'), disabled: ro },
       { label: 'Fill right', kbd: 'Ctrl+R', action: () => fillDirection('right'), disabled: ro },
       '-',
-      { label: 'Delete values', kbd: 'Delete', action: () => clearCells('values'), disabled: ro },
-      { label: 'Delete rows', action: () => structure('delRows'), disabled: ro },
-      { label: 'Delete columns', action: () => structure('delCols'), disabled: ro },
+      { label: 'Delete values', kbd: 'Delete', icon: 'clearContents', action: () => clearCells('values'), disabled: ro },
+      { label: 'Delete rows', icon: 'delRow', action: () => structure('delRows'), disabled: ro },
+      { label: 'Delete columns', icon: 'delCol', action: () => structure('delCols'), disabled: ro },
       { label: 'Delete notes', action: () => clearCells('notes'), disabled: ro },
       { label: 'Clear all', action: () => clearCells('all'), disabled: ro }
     ];
@@ -2711,6 +3285,8 @@ function buildMenubar() {
   add('Format', () => {
     const ro = !canEdit();
     return [
+      { label: 'Format cells…', icon: 'formatCells', action: () => D.formatCellsDialog(A), disabled: ro },
+      '-',
       { label: 'Number', sub: numberFormatItems(), disabled: ro },
       { label: 'Text', disabled: ro, sub: [
         { label: 'Bold', kbd: 'Ctrl+B', icon: 'bold', action: () => toggleStyle('b') }, { label: 'Italic', kbd: 'Ctrl+I', icon: 'italic', action: () => toggleStyle('i') },
@@ -2724,13 +3300,13 @@ function buildMenubar() {
       { label: 'Borders', sub: borderItems(), disabled: ro },
       { label: 'Merge cells', sub: mergeItems(), disabled: ro },
       '-',
-      { label: 'Conditional formatting…', action: () => D.cfDialog(A), disabled: ro },
+      { label: 'Conditional formatting…', icon: 'cf', action: () => D.cfDialog(A), disabled: ro },
       { label: 'Table style…', action: () => D.tableDialog(A), disabled: ro },
       '-',
-      { label: 'Column width…', action: () => D.sizeDialog(A, 'c'), disabled: ro },
-      { label: 'Row height…', action: () => D.sizeDialog(A, 'r'), disabled: ro },
-      { label: 'Fit columns to data', action: () => autoFitColumns(range(selRect().c1, selRect().c2)), disabled: ro },
-      { label: 'Fit rows to data', action: () => autoFitRows(range(selRect().r1, selRect().r2)), disabled: ro },
+      { label: 'Column width…', icon: 'colWidth', action: () => D.sizeDialog(A, 'c'), disabled: ro },
+      { label: 'Row height…', icon: 'rowHeight', action: () => D.sizeDialog(A, 'r'), disabled: ro },
+      { label: 'Fit columns to data', icon: 'fitCols', action: () => autoFitColumns(selLines('c')), disabled: ro },
+      { label: 'Fit rows to data', icon: 'fitRows', action: () => autoFitRows(selLines('r')), disabled: ro },
       '-',
       { label: 'Clear formatting', icon: 'clear', action: () => clearCells('formats'), disabled: ro }
     ];
@@ -2747,8 +3323,8 @@ function buildMenubar() {
       { label: 'Remove duplicates…', action: () => D.dedupeDialog(A), disabled: ro },
       { label: 'Split text to columns…', action: () => D.splitDialog(A), disabled: ro },
       '-',
-      { label: 'Data validation…', action: () => D.dvDialog(A), disabled: ro },
-      { label: 'Named ranges…', action: () => D.namesDialog(A) },
+      { label: 'Data validation…', icon: 'validation', action: () => D.dvDialog(A), disabled: ro },
+      { label: 'Named ranges…', icon: 'tag', action: () => D.namesDialog(A) },
       '-',
       { label: 'What-if analysis', icon: 'whatif', disabled: ro, sub: [
         { label: 'Scenario Manager…', action: () => W.scenarioManager(A) },
@@ -2777,9 +3353,13 @@ function freezeItems() {
   ].map((it) => (typeof it === 'object' ? { ...it, disabled: !canEdit() } : it));
 }
 
-function insertCheckboxes() {
+async function insertCheckboxes() {
   const sh = sheet();
+  if (oneRange('Inserting checkboxes')) return;
   const s = selRect();
+  // cells that are TRUE or FALSE keep their content: their values are read once they are computed
+  const status = await computeValues([{ sheet: sh, ...s }]);
+  if (status !== 'ok') { notComputed(status); return; }
   const ops = [{ t: 'obj', s: sh.id, kind: 'dv', id: Core.randomId(), val: { ...M.rectIds(sh, s), type: 'checkbox', strict: true } }];
   for (let r = s.r1; r <= s.r2; r++) for (let c = s.c1; c <= s.c2; c++) {
     const v = engine.valueAt(sh, r, c);
@@ -2847,10 +3427,19 @@ function fileBase() {
   const id = readableId || (ENTITY && ENTITY.id) || 'issue';
   return String(id).replace(/[^\w.-]+/g, '_');
 }
+/** The cells with content on each sheet, as areas for computeValues (what the downloads and Find read). */
+function usedAreas(sheets) {
+  return sheets.map((sh) => { const u = IO.usedRange(sh); return u.r2 >= 0 && u.c2 >= 0 ? { sheet: sh, r1: 0, c1: 0, r2: u.r2, c2: u.c2 } : null; }).filter(Boolean);
+}
 async function exportXlsx() {
+  // the file keeps the value of each formula, so the values are computed first. A formula that needs more calculation
+  // than the spreadsheet does at once is written without a value: Excel calculates it when it opens the file.
+  const status = await computeValues(usedAreas(view().sheets));
+  if (status === 'pending' || status === 'changed') { notComputed(status); return; }
   try {
     const blob = await IO.writeXlsx(view(), engine, S.version);
     download(blob, fileBase() + '.xlsx');
+    if (status === 'slow') toast('Some formulas need more calculation than the spreadsheet does at once, so the file has them without their values. Excel calculates them when it opens the file.');
   } catch (e) { toast('Could not create the file: ' + e.message, 'error'); }
 }
 /** Opens the menu of a button, or closes it when this button's menu is already open (a second click closes it). */
@@ -2896,15 +3485,27 @@ async function exportCsv() {
   try { saved = JSON.parse(await storageGet('csv') || 'null'); } catch (e) { saved = null; }
   // default: what spreadsheet apps in the person's language expect (semicolons and decimal commas where 1,5 is written)
   const local = localeInfo(LOCALE).dec === ',';
-  D.csvDialog(A, saved || { delim: local ? ';' : ',', dec: local ? ',' : '.' }, (opts) => {
+  // the dialog stays open while the values are computed; closed meanwhile, nothing is downloaded
+  D.csvDialog(A, saved || { delim: local ? ';' : ',', dec: local ? ',' : '.' }, async (opts, isOpen) => {
     storageSet('csv', JSON.stringify(opts));
-    download(IO.writeCsv(engine, sh, LOCALE, opts), fileBase() + ' - ' + sh.name.replace(/[^\w.-]+/g, '_') + '.csv');
+    const status = await computeValues(usedAreas([sh]), { live: isOpen });
+    if (!isOpen()) return false;
+    if (status === 'slow') {
+      toast('Some formulas on this sheet need more calculation than the spreadsheet does at once (they show #CALC!), so the CSV file was not created. The .xlsx download keeps them as formulas.', 'error');
+      return false;
+    }
+    if (status !== 'ok') { notComputed(status); return false; }
+    let blob;
+    try { blob = IO.writeCsv(engine, sh, LOCALE, opts); } catch (e) { toast('Could not create the file: ' + e.message, 'error'); return false; }
+    download(blob, fileBase() + ' - ' + sh.name.replace(/[^\w.-]+/g, '_') + '.csv');
   });
 }
 
 async function importFile(file) {
   if (!file) return;
   if (!store.canEdit) { toast('You can view this spreadsheet but not edit it.'); return; }
+  // checked before the file is read into memory (io.js checks the size again, and what the file unpacks to)
+  if (file.size > 50 * 1024 * 1024) { toast('The file is too large to import (at most 50 MB).', 'error'); return; }
   let imported;
   try {
     if (/\.xlsx$/i.test(file.name) || file.type.includes('spreadsheetml')) imported = await IO.readXlsx(await file.arrayBuffer(), { translate: translateFormula });
@@ -2913,7 +3514,9 @@ async function importFile(file) {
     toast('Could not read the file: ' + e.message, 'error');
     return;
   }
-  const sheets = IO.toSheets(imported);
+  // the same cleaning the server does, so this page shows exactly what is stored (and a crafted file stays harmless)
+  let sheets;
+  try { sheets = IO.toSheets(imported).map((s) => Core.cleanSheet(s)); } catch (e) { toast('Could not read the file: ' + e.message, 'error'); return; }
   if (!sheets.length) { toast('The file has no sheets.', 'error'); return; }
   if (!store.exists) {
     await createWorkbook(sheets);
@@ -2992,7 +3595,7 @@ function wire() {
   $('addSheet').addEventListener('mousedown', (e) => e.preventDefault()); // the focus stays in the grid, so typing does not add more sheets
   $('addSheet').addEventListener('click', () => { addSheet(); focusGrid(); });
   $('allSheets').innerHTML = icon('sheets');
-  $('allSheets').addEventListener('click', (e) => toggleMenu(e.currentTarget, () => view().sheets.map((sh) => ({ label: sh.name, checked: sh.id === S.sheetId, swatch: sh.color || null, action: () => goToSheet(sh.id) }))));
+  $('allSheets').addEventListener('click', (e) => toggleMenu(e.currentTarget, () => view().sheets.map((sh) => ({ label: sh.name, checked: sh.id === S.sheetId, swatch: hex(sh.color), action: () => goToSheet(sh.id) }))));
   $('fxBtn').innerHTML = icon('fx');
   $('fxBtn').addEventListener('click', () => D.functionDialog(A, insertFunction));
   $('zoom').addEventListener('change', (e) => setZoom(+e.target.value));
@@ -3075,7 +3678,16 @@ function wire() {
   document.addEventListener('copy', (e) => onCopy(e, false));
   document.addEventListener('cut', (e) => onCopy(e, true));
   document.addEventListener('paste', onPaste);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && store.exists) store.pull(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    // rounds that were due while the page was in the background (continueCalc) follow now that it is in front
+    if (calcHeld && store.view) {
+      if (roundAllowed() || statusRoundAllowed()) { calcDone = -1; scheduleCalc(); }
+      else if (statusWait) renderStatus(true); // no round may follow: the bar says that the totals are not calculated
+    }
+    calcHeld = false;
+    if (store.exists) store.pull();
+  });
   window.addEventListener('resize', () => { if (store.view) renderGrid(); });
   initResize();
 }
@@ -3153,7 +3765,7 @@ async function loadAndStart() {
     return;
   }
   if (meta._again) { meta._again.remove(); meta._again = null; }
-  renderAll();
+  renderSafely(); // polling starts even if the first drawing fails, so later changes still arrive
   renderPeers();
   sendSelection();
   loadReadableId();

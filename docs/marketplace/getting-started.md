@@ -35,12 +35,12 @@ Users with view-only access see a **View only** tag in the bar ("You can see thi
 - **Edit:** Undo, Redo, Cut, Copy, Paste, Paste special, Find and replace, Fill down, Fill right, and deleting values, rows, columns and notes.
 - **View:** Freeze, Gridlines, Show formulas, hidden rows and columns, Zoom, Change history.
 - **Insert:** rows, columns, Sheet, Table, Chart, Function, Link, Note, Checkbox, Dropdown list, Today's date.
-- **Format:** Number, Text, Alignment, Wrap text, Borders, Merge cells, Conditional formatting…, Table style…, column width and row height, Clear formatting.
+- **Format:** Format cells…, Number, Text, Alignment, Wrap text, Borders, Merge cells, Conditional formatting…, Table style…, column width and row height, Clear formatting.
 - **Data:** Sort A → Z, Sort Z → A, Sort range…, Filter, Format as table…, Remove duplicates…, Split text to columns…, Data validation…, Named ranges…, What-if analysis (Scenario Manager, Goal Seek), Solver…, import and download.
 
 ## Keyboard shortcuts
 
-- **Move and select:** arrow keys; Ctrl+arrow to jump to the edge of the data; Shift to extend the selection; Ctrl+A to select the data region, and Ctrl+A again to select the whole sheet.
+- **Move and select:** arrow keys; Ctrl+arrow to jump to the edge of the data; Shift to extend the selection; Ctrl+click or Ctrl+drag (Cmd on a Mac) to add more cells, ranges, rows or columns to the selection; Ctrl+A to select the data region, and Ctrl+A again to select the whole sheet.
 - **Edit:** type, double-click a cell or press F2 to edit; Enter or Tab to save and move (add Shift to go back); Alt+Enter for a new line in a cell; Ctrl+Enter to fill the selection; Esc to cancel; F4 to switch a reference between relative and absolute.
 - **Clipboard and undo:** Ctrl+C, Ctrl+X and Ctrl+V to copy, cut and paste; Ctrl+Shift+V to paste values only; Ctrl+Z and Ctrl+Y to undo and redo.
 - **Format:** Ctrl+B, Ctrl+I, Ctrl+U and Ctrl+5 for bold, italic, underline and strikethrough.

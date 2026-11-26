@@ -37,7 +37,7 @@ The app does not collect any other personal data.
 ## Who can see the data
 
 - Everyone who can see an issue can view its spreadsheet, its change history (including old values and the names of the people who made each change) and the presence of other people on that issue, and can download the spreadsheet as an .xlsx file or the current sheet as a .csv file.
-- Users who can update the issue, as YouTrack's permissions decide it for that issue, can change the spreadsheet, delete change history entries and delete the spreadsheet. If the project setting **Everyone who can see the issue can edit** is on, everyone who can see the issue can do this.
+- Users who can update the issue, as YouTrack's permissions decide it for that issue, can change the spreadsheet, delete change history entries and delete the spreadsheet. If the project setting **Everyone who can see the issue can edit** is on, everyone who can see the issue can do this, except the guest account (anonymous visitors), which never edits.
 - The data is part of your YouTrack and is hosted wherever your YouTrack is hosted.
 
 ## What leaves YouTrack

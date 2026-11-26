@@ -22,6 +22,9 @@
  * Batches are sent one at a time. Cell edits merge with other people's edits (the last write to a cell wins).
  * Batches that move rows or columns are "strict": the server takes them only on the latest revision, so when
  * someone else changed the sheet first, the batch is rebuilt on the new state (regen) and sent again.
+ *
+ * Everything that comes from the server is cleaned before it is used (Core.cleanDoc for workbooks, Core.cleanOps for
+ * batches): it was written by other people, possibly with an older version of the app.
  */
 const Core = window.SheetCore;
 
@@ -155,21 +158,38 @@ export class Store {
       return;
     }
     this.exists = true;
-    if (res.doc) {
-      this.confirmed = Core.upgrade(res.doc);
-      this.rev = res.doc.rev;
+    const doc = res.doc ? Core.cleanDoc(res.doc) : null;
+    if (doc) {
+      this.confirmed = doc;
+      this.rev = doc.rev;
       this.rebuild();
       this.cb.onChange && this.cb.onChange('reset');
-    } else if (res.batches && res.batches.length) {
+    } else if (res.batches && res.batches.length && this.confirmed) {
       this.applyRemote(res.batches);
+    }
+  }
+
+  /**
+   * Applies one batch from the server to the confirmed workbook. Returns false when it could not be applied: the
+   * workbook here may then differ from the server's, so the whole workbook is loaded again.
+   */
+  applyBatch(b) {
+    try {
+      Core.applyOps(this.confirmed, Core.cleanOps(b.ops, true), { validate: false });
+      return true;
+    } catch (e) {
+      console.warn('Spreadsheets for YouTrack: a change from the server could not be applied; loading the spreadsheet again', e);
+      this.rev = -1;
+      this.reload = true;
+      return false;
     }
   }
 
   applyRemote(batches) {
     let changed = false;
     for (const b of batches) {
-      if (b.rev <= this.rev) continue;
-      try { Core.applyOps(this.confirmed, b.ops, { validate: false }); } catch (e) { console.warn('Remote change failed', e); }
+      if (!b || typeof b.rev !== 'number' || b.rev <= this.rev) continue;
+      if (!this.applyBatch(b)) break;
       this.rev = b.rev;
       this.confirmed.rev = b.rev;
       const mine = this.pending.findIndex((p) => p.bid === b.bid);
@@ -181,12 +201,15 @@ export class Store {
       this.rebuild();
       this.cb.onChange && this.cb.onChange('remote');
     }
+    if (this.reload) { this.reload = false; this.pull(); }
   }
 
   rebuild() {
     this.view = clone(this.confirmed);
     for (const p of this.pending) {
-      try { Core.applyOps(this.view, p.ops, { validate: false }); } catch (e) { /* skip what no longer applies */ }
+      // cleaned as the server will store them, so the view holds the same objects (with their ids) as the workbook
+      // after the confirmation
+      try { Core.applyOps(this.view, Core.cleanOps(p.ops, true), { validate: false }); } catch (e) { /* skip what no longer applies */ }
     }
   }
 
@@ -210,7 +233,7 @@ export class Store {
     const batch = { bid: bidNew(), ops, strict: Core.isStrict(ops), regen: opts.regen || null, undoEntry: opts.undoEntry || null };
     this.pending.push(batch);
     // the bar shows "edited now by <me>" right away; the next poll brings the server's values
-    this.meta = { ...(this.meta || {}), updatedAt: new Date().toISOString(), updatedByName: this.me ? this.me.name : null };
+    this.meta = { ...(this.meta || {}), updatedAt: new Date().toISOString(), updatedByName: this.me ? this.me.name : null, updatedBy: this.me ? this.me.login : null };
     // the save is scheduled before the screen is redrawn, so an error while drawing never loses the change
     this.flushSoon();
     this.cb.onChange && this.cb.onChange('local');
@@ -226,19 +249,22 @@ export class Store {
     if (this.inflight || !this.pending.length || this.stopped) return;
     // merge consecutive non-strict batches into one request
     const batch = this.pending[0];
+    const sentRev = this.rev; // the revision this batch was made on (pulls may change this.rev while it is on its way)
     this.inflight = batch;
     this.cb.onStatus && this.cb.onStatus('saving');
     try {
-      const res = await this.api('ops', { method: 'POST', body: { bid: batch.bid, baseRev: this.rev, strict: batch.strict, ops: batch.ops } });
+      const res = await this.api('ops', { method: 'POST', body: { bid: batch.bid, baseRev: sentRev, strict: batch.strict, ops: batch.ops } });
       this.failures = 0;
       if (!batch.confirmed) {
         if (res.rev === this.rev + 1) {
-          // only our batch happened in between
-          try { Core.applyOps(this.confirmed, batch.ops, { validate: false }); } catch (e) { /* ignore */ }
-          this.rev = res.rev;
-          this.confirmed.rev = res.rev;
+          // only our batch happened in between (the server applied the cleaned batch, so clean it the same way)
+          if (this.applyBatch(batch)) {
+            this.rev = res.rev;
+            this.confirmed.rev = res.rev;
+          }
           const i = this.pending.indexOf(batch);
           if (i >= 0) this.pending.splice(i, 1);
+          if (this.reload) { this.reload = false; this.rebuild(); this.pull(); }
         } else {
           batch.acked = true;
           await this.pull();
@@ -253,16 +279,18 @@ export class Store {
       this.inflight = null;
       const data = e.data || {};
       if (e.status === 409 && data.conflict) {
-        if (data.doc) { this.confirmed = Core.upgrade(data.doc); this.rev = data.doc.rev; }
-        else if (data.batches) {
+        const doc = data.doc ? Core.cleanDoc(data.doc) : null;
+        if (doc) { this.confirmed = doc; this.rev = doc.rev; }
+        else if (Array.isArray(data.batches)) {
           for (const b of data.batches) {
-            if (b.rev <= this.rev) continue;
-            try { Core.applyOps(this.confirmed, b.ops, { validate: false }); } catch (x) { /* ignore */ }
+            if (!b || typeof b.rev !== 'number' || b.rev <= this.rev) continue;
+            if (!this.applyBatch(b)) break;
             this.rev = b.rev; this.confirmed.rev = b.rev;
             const mine = this.pending.findIndex((p) => p.bid === b.bid && p !== batch);
             if (mine >= 0) this.pending.splice(mine, 1);
           }
         }
+        if (this.reload) { this.reload = false; this.pull(); }
         const i = this.pending.indexOf(batch);
         if (i >= 0) this.pending.splice(i, 1);
         this.rebuild();
@@ -287,6 +315,18 @@ export class Store {
         return;
       }
       if (e.status === 404 && data.gone) {
+        // the batch was made on a workbook that was deleted; if this browser already shows the one created after it
+        // (a pull ran while the batch was on its way), only that batch is dropped
+        if (this.exists && this.confirmed && typeof this.confirmed.base === 'number' && sentRev < this.confirmed.base) {
+          const i = this.pending.indexOf(batch);
+          if (i >= 0) this.pending.splice(i, 1);
+          if (batch.undoEntry) batch.undoEntry.dead = true;
+          this.rebuild();
+          this.cb.onChange && this.cb.onChange('remote');
+          this.cb.onStatus && this.cb.onStatus(this.pending.length ? 'saving' : 'saved');
+          this.flushSoon();
+          return;
+        }
         this.pending = [];
         this.exists = false;
         this.confirmed = this.view = null;

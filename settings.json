@@ -7,7 +7,7 @@
     "readersCanEdit": {
       "type": "boolean",
       "title": "Everyone who can see the issue can edit",
-      "description": "Off (default): users with the Update Issue permission in this project can create and edit spreadsheets, from whichever role grants it (global, project or custom roles); users who can only read the issue can view them. On: every user who can see the issue can edit.",
+      "description": "Off (default): users with the Update Issue permission in this project can create and edit spreadsheets, from whichever role grants it (global, project or custom roles); users who can only read the issue can view them. On: every signed-in user who can see the issue can edit (the guest account never edits).",
       "x-scope": "PROJECT"
     },
     "editorGroups": {

@@ -16,12 +16,16 @@
 /* Spreadsheets for YouTrack – dialogs and side panels: tables, charts, notes, conditional formatting, data validation, sort,
  * remove duplicates, split text, find and replace, named ranges, sizes, number formats, functions, links, filters,
  * import options and the change history. Every change goes through A.commit() (shared, undoable). */
-import { h, esc, icon, dialog, confirmDialog, promptDialog, field, select, checkbox, colorPicker, popover, closePopups, toast, relTime, initials, peerColor, contrastText, luminance, themedColors, paintBar } from './ui.js';
+import { h, esc, icon, dialog, confirmDialog, promptDialog, field, select, checkbox, colorPicker, popover, closePopups, toast, relTime, initials, peerColor, contrastText, luminance, themedColors, paintBar, hexColor } from './ui.js';
 import * as M from './model.js';
-import { colName, formatValue, parseInput, isErr, FUNCTION_NAMES, FUNCTION_HELP, formatWithPattern, quoteSheet, editText, formulaSyntaxError, numToText } from './formula.js';
+import { colName, formatValue, parseInput, isErr, FUNCTION_NAMES, FUNCTION_HELP, formatWithPattern, quoteSheet, editText, formulaSyntaxError, numToText, isSlowCalc } from './formula.js';
 import { CHART_TYPES } from './charts.js';
 
 const Core = window.SheetCore;
+/** The stored objects of one kind (tables, rules, …): anything that is not an object counts as absent. */
+const objs = (v) => (Array.isArray(v) ? v.filter((o) => o && typeof o === 'object' && !Array.isArray(o)) : []);
+/** A stored value that should be text or a number: objects and arrays count as absent. */
+const plain = (v) => (v !== null && typeof v === 'object' ? undefined : v);
 
 export const prompt = (title, label, value, opts) => promptDialog(title, label, value, opts);
 
@@ -41,6 +45,27 @@ function defaultRegion(A) {
   if (s.r1 === s.r2 && s.c1 === s.c2) return M.currentRegion(A.sheet(), s.r1, s.c1);
   return s;
 }
+/**
+ * Computes the values a command reads before it acts on them (the formula work budget may have left some out, see
+ * A.computeValues in app.js). True when they are all computed and the dialog `dlg` (when given) is still open; false
+ * when it was closed meanwhile (nothing is done) or after saying why the values are not there.
+ */
+async function valuesReady(A, areas, dlg) {
+  const status = await A.computeValues(areas, dlg ? { live: () => dlg.el.isConnected } : undefined);
+  if (dlg && !dlg.el.isConnected) return false;
+  if (status === 'ok') return true;
+  A.notComputed(status);
+  return false;
+}
+/** Sorts a range once the values of its sort columns are computed. False when they are not (nothing was done). */
+async function sortRange(A, sh, rect, keys, hasHeader, dlg) {
+  const top = rect.r1 + (hasHeader ? 1 : 0);
+  if (!(await valuesReady(A, keys.map((k) => ({ sheet: sh, r1: top, c1: k.c, r2: rect.r2, c2: k.c })), dlg))) return false;
+  const ops = M.sortOps(A.engine, sh, rect, keys, hasHeader);
+  if (!ops) { A.notComputed('pending'); return false; }
+  A.commit(ops, { label: 'Sort' });
+  return true;
+}
 
 /* ================================================================ tables */
 
@@ -48,7 +73,7 @@ export function tableDialog(A) {
   if (!A.canEdit()) return;
   const sh = A.sheet();
   const x = A.ix(sh);
-  const existing = (sh.tables || []).find((t) => M.inRect(M.objRect(t, x), A.S.sel.r, A.S.sel.c));
+  const existing = objs(sh.tables).find((t) => M.inRect(M.objRect(t, x), A.S.sel.r, A.S.sel.c));
   const rect = existing ? M.objRect(existing, x) : defaultRegion(A);
   const t = existing || { name: M.uniqueTableName(A.view()), header: true, totals: false, style: 'blue', banded: true, filter: true, filters: {} };
   const name = h('input', { class: 'input', value: t.name, spellcheck: 'false' });
@@ -88,19 +113,21 @@ export function tableDialog(A) {
     h('div', { class: 'checks' }, header.el, totals.el, banded.el, filter.el),
     field('Style', swatches));
   const buttons = [{ label: 'Cancel' }];
-  dialog(existing ? 'Table ' + t.name : 'Format as table', body, buttons.concat([{
-    label: existing ? 'Save' : 'Create table', primary: true, action: () => {
+  const dlg = dialog(existing ? 'Table ' + t.name : 'Format as table', body, buttons.concat([{
+    label: existing ? 'Save' : 'Create table', primary: true, action: async () => {
       const R = readRange(A, range);
       if (!R) return false;
       if (R.sheet !== sh) { toast('A table must be on the current sheet.', 'error'); return false; }
       const n = name.value.trim();
       if (!Core.NAME_RE.test(n) || /^[A-Za-z]{1,3}\d+$/.test(n)) { toast('Table names start with a letter and contain only letters, digits, "_" and "." (not a cell address).', 'error'); return false; }
-      if (A.view().sheets.some((s2) => (s2.tables || []).some((o) => o.id !== t.id && o.name.toLowerCase() === n.toLowerCase()))) { toast('Another table is already named ' + n + '.', 'error'); return false; }
-      for (const o of sh.tables || []) {
+      if (A.view().sheets.some((s2) => objs(s2.tables).some((o) => o.id !== t.id && typeof o.name === 'string' && o.name.toLowerCase() === n.toLowerCase()))) { toast('Another table is already named ' + n + '.', 'error'); return false; }
+      for (const o of objs(sh.tables)) {
         if (o.id === t.id) continue;
         const r2 = M.objRect(o, x);
         if (r2 && !(r2.r2 < R.r1 || r2.r1 > R.r2 || r2.c2 < R.c1 || r2.c1 > R.c2)) { toast('Tables cannot overlap (' + o.name + ').', 'error'); return false; }
       }
+      // a new totals row adds up the numeric columns: their values are read once they are computed
+      if (totals.input.checked && !t.totals && !(await valuesReady(A, [R], dlg))) return false;
       const ops = [];
       let r2 = R.r2;
       const id = t.id || Core.randomId();
@@ -136,10 +163,10 @@ export function tableDialog(A) {
       if (header.input.checked && !existing) {
         for (let c = R.c1; c <= R.c2; c++) { const cell = M.cellAt(sh, R.r1, c); if (!cell || cell.v === undefined) ops.push({ t: 'set', s: sh.id, k: M.keyAt(sh, R.r1, c), v: 'Column' + (c - R.c1 + 1) }); }
       }
-      if (existing && n !== t.name) {
-        // rename structured references
-        const re = new RegExp('(^|[^\\w.])' + t.name.replace(/[.]/g, '\\.') + '(?=\\[|\\b)', 'gi');
-        for (const s2 of A.view().sheets) for (const k in s2.cells) { const v = s2.cells[k].v; if (typeof v === 'string' && v[0] === '=' && re.test(v)) { re.lastIndex = 0; ops.push({ t: 'set', s: s2.id, k, v: v.replace(re, '$1' + n) }); } re.lastIndex = 0; }
+      if (existing && n !== t.name && typeof t.name === 'string' && Core.NAME_RE.test(t.name)) {
+        // rename structured references (the old name is stored data: every regex character in it is escaped)
+        const re = new RegExp('(^|[^\\w.])' + t.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=\\[|\\b)', 'gi');
+        for (const s2 of A.view().sheets) for (const k in s2.cells) { const v = (s2.cells[k] || {}).v; if (typeof v === 'string' && v[0] === '=' && re.test(v)) { re.lastIndex = 0; ops.push({ t: 'set', s: s2.id, k, v: v.replace(re, '$1' + n) }); } re.lastIndex = 0; }
       }
       return A.commit(ops, { label: existing ? 'Table' : 'Create table' }) ? undefined : false;
     }
@@ -153,24 +180,37 @@ export function tableDialog(A) {
 
 /* ---- filter popover in a table header */
 
-export function filterPopover(A, tableId, c, anchor) {
+export async function filterPopover(A, tableId, c, anchor) {
   const sh = A.sheet();
-  const t = (sh.tables || []).find((o) => o.id === tableId);
+  const t = objs(sh.tables).find((o) => o.id === tableId);
   if (!t) return;
   const x = A.ix(sh);
   const rect = M.objRect(t, x);
+  if (!rect) return;
   const colId = sh.cols[c];
   const spec = (t.filters || {})[colId] || {};
   const top = rect.r1 + (t.header !== false ? 1 : 0), bottom = rect.r2 - (t.totals ? 1 : 0);
+  // the list offers the column's values, so they are computed first. A formula that needs more calculation than the
+  // spreadsheet does at once has no value to offer: its row stays visible whatever is chosen.
+  const sel = JSON.stringify(A.S.sel);
+  const status = await A.computeValues([{ sheet: sh, r1: top, c1: c, r2: bottom, c2: c }]);
+  if (status === 'pending' || status === 'changed') { A.notComputed(status); return; }
+  // the button may have been drawn again meanwhile; when it scrolled away, or the person went on to something else
+  // while the values were computed, the list does not open
+  const btn = [...document.querySelectorAll('[data-flt]')].find((b) => b.dataset.flt === tableId && +b.dataset.fc === c);
+  if (!btn || JSON.stringify(A.S.sel) !== sel || document.querySelector('.modal-back')) return;
+  anchor = btn.getBoundingClientRect();
   const values = new Map();
+  let notCalculated = false;
   for (let r = top; r <= bottom; r++) {
     const cell = M.cellAt(sh, r, c);
     const v = A.engine.valueAt(sh, r, c);
+    if (isSlowCalc(v)) { notCalculated = true; continue; }
     const txt = M.filterText(v, cell && cell.st, A.LOCALE);
     if (!values.has(txt)) values.set(txt, v);
   }
   const sorted = [...values.entries()].sort((a, b) => (a[0] === '' ? 1 : b[0] === '' ? -1 : typeof a[1] === 'number' && typeof b[1] === 'number' ? a[1] - b[1] : a[0].localeCompare(b[0], A.LOCALE, { numeric: true })));
-  const allowed = new Set(spec.vals || sorted.map((e) => e[0]));
+  const allowed = new Set(Array.isArray(spec.vals) ? spec.vals : sorted.map((e) => e[0]));
   const ro = !A.canEdit();
   const list = h('div', { class: 'flt-list' });
   const search = h('input', { class: 'input small', placeholder: 'Search', 'aria-label': 'Search values' });
@@ -196,7 +236,7 @@ export function filterPopover(A, tableId, c, anchor) {
   };
   const sortBtn = (desc) => h('button', { class: 'menu-item', type: 'button', disabled: ro, onclick: () => {
     closePopups();
-    A.commit(M.sortOps(A.engine, sh, { ...rect, r2: bottom }, [{ c, desc }], t.header !== false), { label: 'Sort' });
+    sortRange(A, sh, { ...rect, r2: bottom }, [{ c, desc }], t.header !== false);
   } }, h('span', { class: 'mi-icon', html: icon(desc ? 'sortDesc' : 'sortAsc') }), h('span', { class: 'mi-label' }, desc ? 'Sort Z → A' : 'Sort A → Z'));
   const content = h('div', { class: 'flt' },
     sortBtn(false), sortBtn(true),
@@ -207,6 +247,7 @@ export function filterPopover(A, tableId, c, anchor) {
       h('button', { class: 'link-btn', type: 'button', disabled: ro, onclick: () => { allowed.clear(); boxes.forEach((b) => { b.checked = false; }); } }, 'Clear')),
     sorted.length > 8 ? search : null,
     list,
+    notCalculated ? h('div', { class: 'muted small' }, 'Rows whose formula is not calculated (#CALC!) are not filtered.') : null,
     h('div', { class: 'flt-foot' },
       h('button', { class: 'btn small', type: 'button', disabled: ro || !spec.vals && !spec.cond, onclick: () => { const f = { ...(t.filters || {}) }; delete f[colId]; apply(f); } }, 'Clear filter'),
       h('button', { class: 'btn small primary', type: 'button', disabled: ro, onclick: () => {
@@ -226,7 +267,7 @@ export function chartDialog(A, chartId) {
   if (!A.canEdit()) return;
   const sh = A.sheet();
   const x = A.ix(sh);
-  const existing = chartId ? (sh.charts || []).find((c) => c.id === chartId) : null;
+  const existing = chartId ? objs(sh.charts).find((c) => c.id === chartId) : null;
   const rect = existing ? M.objRect(existing, x) : defaultRegion(A);
   const type = select(CHART_TYPES, existing ? existing.type : 'column');
   const title = h('input', { class: 'input', value: existing ? existing.title || '' : '' });
@@ -295,6 +336,11 @@ const CF_PRESETS = {
   bold: { b: 1, label: 'Bold text' },
   redText: { fc: '#cc0000', label: 'Red text' }
 };
+/** The colors of a color scale: the stored ones when they are a #rrggbb color for each point, otherwise the defaults. */
+function scaleColors(colors, type) {
+  const def = type === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a'];
+  return Array.isArray(colors) && colors.length === def.length && colors.every((c) => hexColor(c)) ? colors : def;
+}
 
 export function cfDialog(A) {
   const sh = A.sheet();
@@ -303,30 +349,31 @@ export function cfDialog(A) {
   const x = A.ix(sh);
   const renderList = () => {
     box.innerHTML = '';
-    const rules = sh.cf || [];
+    const rules = objs(sh.cf);
     const list = h('div', { class: 'rule-list' });
     if (!rules.length) list.appendChild(h('div', { class: 'muted pad' }, 'No rules on this sheet yet.'));
     rules.forEach((rule, i) => {
       const rect = M.objRect(rule, x);
       // the rule's format in the colors the cells get in the current theme (as cellCss in app.js); scales and data bars
-      // keep their colors in both themes, as in the cells
-      const rs = rule.style || {};
-      const tc = themedColors(rs.bg, rs.fc);
+      // keep their colors in both themes, as in the cells. Rules are stored data: only #rrggbb colors reach the style,
+      // anything else counts as no color.
+      const rs = rule.style && typeof rule.style === 'object' ? rule.style : {};
+      const type = typeof rule.type === 'string' ? rule.type : '';
+      const bg = hexColor(rs.bg);
+      const tc = themedColors(bg, hexColor(rs.fc));
       const css = tc.parts.slice();
-      if (rs.bg && !tc.cls.includes('f')) css.push('background:' + rs.bg);
-      else if (!rs.bg && rule.type.startsWith('scale')) {
-        const cols = rule.colors || (rule.type === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a']);
+      if (!bg && type.startsWith('scale')) {
+        const cols = scaleColors(rule.colors, type);
         const L = cols.reduce((sum, c) => sum + (luminance(c) ?? 1), 0) / cols.length;
         css.push('background:linear-gradient(90deg,' + cols.join(',') + ')', 'color:' + (L > 0.3 ? '#1f2023' : '#f5f6f8'));
       }
-      else if (!rs.bg && rule.type === 'bar') css.push('background:linear-gradient(90deg,color-mix(in srgb,' + (rule.color || '#3369d6') + ' 45%,transparent) 60%,transparent 60%)');
-      if (rs.fc && !tc.cls.includes('c')) css.push('color:' + rs.fc);
+      else if (!bg && type === 'bar') css.push('background:linear-gradient(90deg,color-mix(in srgb,' + (hexColor(rule.color) || '#3369d6') + ' 45%,transparent) 60%,transparent 60%)');
       if (rs.b) css.push('font-weight:600');
       if (rs.i) css.push('font-style:italic');
       const sample = h('span', { class: 'cf-sample' + tc.cls, style: css.join(';') || null }, 'Aa 123');
       list.appendChild(h('div', { class: 'rule' },
         sample,
-        h('div', { class: 'rule-text' }, h('b', null, M.CF_TYPES[rule.type] || rule.type), ' ', ruleArgs(rule), h('div', { class: 'muted small' }, rect ? M.rectText(rect) : '(range deleted)')),
+        h('div', { class: 'rule-text' }, h('b', null, M.CF_TYPES[type] || type), ' ', ruleArgs(rule), h('div', { class: 'muted small' }, rect ? M.rectText(rect) : '(range deleted)')),
         h('button', { class: 'icon-btn', type: 'button', title: 'Move up', 'aria-label': 'Move up', disabled: i === 0 || !A.canEdit(), html: icon('up'), onclick: () => reorder(i, -1) }),
         h('button', { class: 'btn small', type: 'button', disabled: !A.canEdit(), onclick: () => edit(rule) }, 'Edit'),
         h('button', { class: 'btn small', type: 'button', disabled: !A.canEdit(), onclick: () => { A.commit([{ t: 'obj', s: sh.id, kind: 'cf', id: rule.id, val: null }], { label: 'Delete rule' }); setTimeout(renderList, 0); } }, 'Delete')));
@@ -335,30 +382,32 @@ export function cfDialog(A) {
     if (A.canEdit()) box.appendChild(h('button', { class: 'btn primary', type: 'button', onclick: () => edit(null) }, 'Add rule'));
   };
   const ruleArgs = (rule) => {
-    if (['between', 'notBetween'].includes(rule.type)) return `${rule.a ?? ''} and ${rule.b ?? ''}`;
-    if (rule.type === 'formula') return A.fmlLocal(rule.formula || '');
-    if (['top', 'bottom'].includes(rule.type)) return `${rule.a || 10}${rule.pct ? '%' : ''}`;
-    if (rule.a !== undefined && rule.a !== '') return String(rule.a);
+    const a = plain(rule.a), b = plain(rule.b);
+    if (['between', 'notBetween'].includes(rule.type)) return `${a ?? ''} and ${b ?? ''}`;
+    if (rule.type === 'formula') return A.fmlLocal(typeof rule.formula === 'string' ? rule.formula : '');
+    if (['top', 'bottom'].includes(rule.type)) return `${a || 10}${rule.pct ? '%' : ''}`;
+    if (a !== undefined && a !== '') return String(a);
     return '';
   };
   const reorder = (i, delta) => {
-    const rules = (sh.cf || []).slice();
+    const rules = objs(sh.cf);
     const [r] = rules.splice(i, 1);
     rules.splice(i + delta, 0, r);
-    const ops = (sh.cf || []).map((o) => ({ t: 'obj', s: sh.id, kind: 'cf', id: o.id, val: null })).concat(rules.map((o) => ({ t: 'obj', s: sh.id, kind: 'cf', id: o.id, val: { ...o } })));
+    const ops = objs(sh.cf).map((o) => ({ t: 'obj', s: sh.id, kind: 'cf', id: o.id, val: null })).concat(rules.map((o) => ({ t: 'obj', s: sh.id, kind: 'cf', id: o.id, val: { ...o } })));
     A.commit(ops, { label: 'Reorder rules' });
     setTimeout(renderList, 0);
   };
   const edit = (rule) => {
     const rect = rule ? M.objRect(rule, x) || A.selRect() : A.selRect();
     const range = rangeInput(A, rect);
-    const type = select(M.CF_TYPES, rule ? rule.type : 'gt');
-    const a = h('input', { class: 'input', value: rule ? rule.a ?? '' : '' });
-    const b = h('input', { class: 'input', value: rule ? rule.b ?? '' : '' });
-    const formula = h('input', { class: 'input mono', value: rule ? A.fmlLocal(rule.formula || '') : '=' + colName(rect.c1) + (rect.r1 + 1) + '>100', spellcheck: 'false' });
+    const type = select(M.CF_TYPES, rule ? plain(rule.type) : 'gt');
+    const a = h('input', { class: 'input', value: rule ? plain(rule.a) ?? '' : '' });
+    const b = h('input', { class: 'input', value: rule ? plain(rule.b) ?? '' : '' });
+    const formula = h('input', { class: 'input mono', value: rule ? A.fmlLocal(typeof rule.formula === 'string' ? rule.formula : '') : '=' + colName(rect.c1) + (rect.r1 + 1) + '>100', spellcheck: 'false' });
     const pct = checkbox('Percent of items', rule ? !!rule.pct : false);
     const preset = select(Object.fromEntries(Object.entries(CF_PRESETS).map(([k, v]) => [k, v.label]).concat([['custom', 'Custom…']])), rule && rule.style ? (Object.entries(CF_PRESETS).find(([, p]) => p.bg === rule.style.bg && p.fc === rule.style.fc && !!p.b === !!rule.style.b) || ['custom'])[0] : 'red');
-    let custom = rule && rule.style ? { ...rule.style } : { bg: '#f4cccc', fc: '#990000' };
+    // only #rrggbb colors of a stored format are taken over (they reach the color bars and the saved rule)
+    let custom = rule && rule.style ? { ...rule.style, bg: hexColor(rule.style.bg), fc: hexColor(rule.style.fc) } : { bg: '#f4cccc', fc: '#990000' };
     // the picked colors show as a bar under the labels, as on the toolbar (the labels stay readable in both themes)
     const bgBtn = h('button', { class: 'btn small has-cbar', type: 'button', 'data-popup-anchor': '' }, 'Fill', h('span', { class: 'cbar', 'aria-hidden': 'true' }));
     const fcBtn = h('button', { class: 'btn small has-cbar', type: 'button', 'data-popup-anchor': '' }, 'Text', h('span', { class: 'cbar', 'aria-hidden': 'true' }));
@@ -367,9 +416,10 @@ export function cfDialog(A) {
     fcBtn.onclick = () => colorPicker(fcBtn.getBoundingClientRect(), custom.fc, (c2) => { custom.fc = c2; paintCustom(); });
     const paintCustom = () => { paintBar(bgBtn, custom.bg, false); paintBar(fcBtn, custom.fc, true); };
     paintCustom();
-    const colors = (rule && rule.colors) ? rule.colors.slice() : null;
+    // stored scale and bar colors are used only when they are #rrggbb (they reach the swatch buttons' style)
+    const colors = rule && Array.isArray(rule.colors) && rule.colors.every((c) => hexColor(c)) ? rule.colors.slice() : null;
     const scaleRow = h('div', { class: 'row2' });
-    const barColor = { v: rule && rule.color || '#3369d6' };
+    const barColor = { v: hexColor(rule && rule.color) || '#3369d6' };
     const update = () => {
       const t = type.value;
       const needsA = ['gt', 'lt', 'ge', 'le', 'eq', 'ne', 'between', 'notBetween', 'contains', 'notContains', 'begins', 'ends', 'top', 'bottom'].includes(t);
@@ -382,7 +432,9 @@ export function cfDialog(A) {
       scaleRow.hidden = !['scale2', 'scale3', 'bar'].includes(t);
       scaleRow.innerHTML = '';
       if (t === 'scale2' || t === 'scale3') {
-        const cs = colors && colors.length === (t === 'scale2' ? 2 : 3) ? colors : (t === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a']);
+        // the colors picked so far (kept when the dialog repaints), else the rule's stored ones, else the defaults
+        const want = t === 'scale2' ? 2 : 3;
+        const cs = (colorsRef.v && colorsRef.v.length === want ? colorsRef.v : colors && colors.length === want ? colors : (t === 'scale2' ? ['#ffffff', '#57bb8a'] : ['#e67c73', '#ffd666', '#57bb8a'])).slice();
         cs.forEach((col, i) => {
           const btn = h('button', { class: 'btn small swatch-btn', type: 'button', style: { background: col, color: contrastText(col) || '' }, 'data-popup-anchor': '' }, ['Min', t === 'scale3' ? 'Mid' : 'Max', 'Max'][i]);
           btn.onclick = () => colorPicker(btn.getBoundingClientRect(), col, (c2) => { cs[i] = c2 || col; colorsRef.v = cs; update(); });
@@ -468,10 +520,10 @@ export function dvDialog(A, presetType) {
     field('Custom formula', formula),
     field('Message for invalid values', msg),
     strict.el, arrows.el);
-  dialog('Data validation', body, [
+  const dlg = dialog('Data validation', body, [
     { label: 'Cancel' },
     existing ? { label: 'Remove', danger: true, action: () => { A.commit([{ t: 'obj', s: sh.id, kind: 'dv', id: existing.id, val: null }], { label: 'Data validation' }); } } : null,
-    { label: 'Save', primary: true, action: () => {
+    { label: 'Save', primary: true, action: async () => {
       const R = readRange(A, range);
       if (!R) return false;
       if (R.sheet !== sh) { toast('Validation applies to the current sheet.', 'error'); return false; }
@@ -483,13 +535,15 @@ export function dvDialog(A, presetType) {
       if (t === 'formula') val.formula = A.fmlStored(formula.value.trim());
       const ops = [];
       // one rule per cell: rules this one covers are replaced
-      for (const o of sh.dv || []) {
+      for (const o of objs(sh.dv)) {
         if (existing && o.id === existing.id) continue;
         const r2 = M.objRect(o, x);
         if (r2 && r2.r1 >= R.r1 && r2.r2 <= R.r2 && r2.c1 >= R.c1 && r2.c2 <= R.c2) ops.push({ t: 'obj', s: sh.id, kind: 'dv', id: o.id, val: null });
       }
       ops.push({ t: 'obj', s: sh.id, kind: 'dv', id: existing ? existing.id : Core.randomId(), val });
       if (t === 'checkbox') {
+        // cells that are TRUE or FALSE keep their content: their values are read once they are computed
+        if (!(await valuesReady(A, [R], dlg))) return false;
         for (let r = R.r1; r <= R.r2; r++) for (let c = R.c1; c <= R.c2; c++) {
           const v = A.engine.valueAt(sh, r, c);
           if (v !== true && v !== false) ops.push({ t: 'set', s: sh.id, k: M.keyAt(sh, r, c), v: 'FALSE' });
@@ -529,15 +583,16 @@ export function sortDialog(A) {
   };
   addLevel(A.S.sel.c >= rect.c1 && A.S.sel.c <= rect.c2 ? A.S.sel.c : rect.c1, false);
   header.input.addEventListener('change', () => { const keep = [...levels.children].map((r) => r._get()); levels.innerHTML = ''; keep.forEach((k) => addLevel(k.c, k.desc)); });
-  dialog('Sort range', h('div', { class: 'form' }, field('Range', range), header.el, levels,
+  const dlg = dialog('Sort range', h('div', { class: 'form' }, field('Range', range), header.el, levels,
     h('button', { class: 'btn small', type: 'button', onclick: () => addLevel() }, 'Add another sort column')), [
     { label: 'Cancel' },
-    { label: 'Sort', primary: true, action: () => {
+    { label: 'Sort', primary: true, action: async () => {
       const R = readRange(A, range);
       if (!R) return false;
       const keys = [...levels.children].map((r) => r._get()).filter((k) => k.c >= R.c1 && k.c <= R.c2);
       if (!keys.length) { toast('Choose a column inside the range.', 'error'); return false; }
-      A.commit(M.sortOps(A.engine, R.sheet, R, keys, header.input.checked), { label: 'Sort' });
+      // the dialog stays open while the sort columns are computed
+      return (await sortRange(A, R.sheet, R, keys, header.input.checked, dlg)) ? undefined : false;
     } }]);
 }
 
@@ -560,14 +615,20 @@ export function dedupeDialog(A) {
   fillCols();
   range.addEventListener('change', fillCols);
   header.input.addEventListener('change', fillCols);
-  dialog('Remove duplicates', h('div', { class: 'form' }, field('Range', range), header.el, field('Compare these columns', cols)), [
+  const dlg = dialog('Remove duplicates', h('div', { class: 'form' }, field('Range', range), header.el, field('Compare these columns', cols)), [
     { label: 'Cancel' },
-    { label: 'Remove duplicates', primary: true, action: () => {
+    { label: 'Remove duplicates', primary: true, action: async () => {
       const R = readRange(A, range);
       if (!R) return false;
       const chosen = [...cols.querySelectorAll('input:checked')].map((i) => +i.dataset.c);
       if (!chosen.length) { toast('Choose at least one column.', 'error'); return false; }
-      const { ops, removed } = M.dedupeOps(A.engine, R.sheet, R, chosen, header.input.checked);
+      const hasHeader = header.input.checked;
+      // rows are compared by the values of the chosen columns: the dialog stays open while they are computed
+      const top = R.r1 + (hasHeader ? 1 : 0);
+      if (!(await valuesReady(A, chosen.map((c) => ({ sheet: R.sheet, r1: top, c1: c, r2: R.r2, c2: c })), dlg))) return false;
+      const res = M.dedupeOps(A.engine, R.sheet, R, chosen, hasHeader);
+      if (!res) { A.notComputed('pending'); return false; }
+      const { ops, removed } = res;
       if (!removed) { toast('No duplicates found.'); return; }
       if (A.commit(ops, { label: 'Remove duplicates' })) toast(removed === 1 ? 'Removed 1 duplicate row.' : 'Removed ' + removed + ' duplicate rows.');
     } }]);
@@ -579,9 +640,11 @@ export function splitDialog(A) {
   const s = A.selRect();
   const delim = select({ auto: 'Detect automatically', ',': 'Comma', ';': 'Semicolon', '\t': 'Tab', ' ': 'Space', custom: 'Custom' }, 'auto');
   const custom = h('input', { class: 'input small', placeholder: 'Separator' });
-  dialog('Split text to columns', h('div', { class: 'form' }, h('p', { class: 'dlg-text' }, `Splits the text in ${M.rectText({ ...s, c2: s.c1 })} into the columns to the right.`), h('div', { class: 'row2' }, field('Separator', delim), field('Custom separator', custom))), [
+  const dlg = dialog('Split text to columns', h('div', { class: 'form' }, h('p', { class: 'dlg-text' }, `Splits the text in ${M.rectText({ ...s, c2: s.c1 })} into the columns to the right.`), h('div', { class: 'row2' }, field('Separator', delim), field('Custom separator', custom))), [
     { label: 'Cancel' },
-    { label: 'Split', primary: true, action: () => {
+    { label: 'Split', primary: true, action: async () => {
+      // the texts are read once they are computed (a value left out is not skipped as if it were no text)
+      if (!(await valuesReady(A, [{ sheet: sh, r1: s.r1, c1: s.c1, r2: s.r2, c2: s.c1 }], dlg))) return false;
       const ops = [];
       let maxW = 0;
       const rows = [];
@@ -608,14 +671,16 @@ export function splitDialog(A) {
 
 /* ================================================================ find and replace */
 
-/** Download sheet as CSV: the separator between values and the decimal mark of plain numbers. */
+/** Download sheet as CSV: the separator between values and the decimal mark of plain numbers. onDownload(opts, isOpen)
+ * may be async (the dialog waits for it, and stays open when it gives false); isOpen() tells whether the dialog is
+ * still open. */
 export function csvDialog(A, opts, onDownload) {
   const delim = select([[',', 'Comma ( , )'], [';', 'Semicolon ( ; )'], ['\t', 'Tab']], opts.delim || ',');
   const dec = select([['.', 'Point: 1.5'], [',', 'Comma: 1,5']], opts.dec || '.');
-  dialog('Download sheet as CSV', h('div', { class: 'form' },
+  const dlg = dialog('Download sheet as CSV', h('div', { class: 'form' },
     field('Separator between values', delim),
     field('Decimal separator in numbers', dec, 'Numbers with a number format are written as they are shown. Values that contain the separator are put in quotes.')), [
-    { label: 'Download', primary: true, action: () => { onDownload({ delim: delim.value, dec: dec.value }); } },
+    { label: 'Download', primary: true, action: () => onDownload({ delim: delim.value, dec: dec.value }, () => dlg.el.isConnected) },
     { label: 'Cancel' }
   ]);
 }
@@ -629,8 +694,39 @@ export function findDialog(A, replace) {
   const scope = select({ sheet: 'This sheet', all: 'All sheets' }, A.S.find ? A.S.find.scope : 'sheet');
   const status = h('div', { class: 'muted small find-status', 'aria-live': 'polite' });
   const opts = () => ({ q: what.value, repl: repl.value, case: matchCase.input.checked, whole: whole.input.checked, formulas: formulas.input.checked, scope: scope.value });
+  // values are searched once they are computed (the formula work budget may have left some out). False, with the
+  // reason in the status line, when they are not.
+  // only cells that exist are searched (matches), and only formulas need computing: not the whole used rectangle
+  const formulaCells = (sheets) => {
+    const out = [];
+    for (const sh of sheets) {
+      const x = A.ix(sh);
+      for (const k in sh.cells) {
+        const v = sh.cells[k] && sh.cells[k].v;
+        if (typeof v !== 'string' || v[0] !== '=') continue;
+        const [rid, cid] = k.split(':');
+        const r = x.rows.get(rid), c = x.cols.get(cid);
+        if (r !== undefined && c !== undefined) out.push({ sheet: sh, r1: r, c1: c, r2: r, c2: c });
+      }
+    }
+    return out;
+  };
+  const searchable = async () => {
+    const o = opts();
+    if (!o.q) return true;
+    const st = await A.computeValues(formulaCells(o.scope === 'all' ? A.view().sheets : [A.sheet()]), { live: () => dlg.el.isConnected });
+    if (!dlg.el.isConnected) return false;
+    if (st === 'pending' || st === 'changed') {
+      status.textContent = st === 'changed' ? 'The spreadsheet changed while its values were being calculated. Try again.' : 'Some values are still being calculated. Try again in a moment.';
+      return false;
+    }
+    return true;
+  };
+  let unsearched = false; // a value was not searched: its formula needs more calculation than the spreadsheet does at once
+  const note = () => (unsearched ? ' Values that are not calculated (#CALC!) were not searched.' : '');
   const matches = () => {
     const o = opts();
+    unsearched = false;
     if (!o.q) return [];
     const out = [];
     const sheets = o.scope === 'all' ? A.view().sheets : [A.sheet()];
@@ -643,8 +739,10 @@ export function findDialog(A, replace) {
         const [rid, cid] = k.split(':');
         const r = x.rows.get(rid), c = x.cols.get(cid);
         if (r === undefined || c === undefined) continue;
-        const shown = formatValue(A.engine.valueAt(sh, r, c), cell.st, A.LOCALE);
-        const texts = [shown];
+        const v = A.engine.valueAt(sh, r, c);
+        const texts = [];
+        if (isSlowCalc(v)) unsearched = true;
+        else texts.push(formatValue(v, cell.st, A.LOCALE));
         if (o.formulas && cell.v && cell.v[0] === '=') texts.push(cell.v);
         if (texts.some((t) => (o.whole ? norm(t) === q : norm(t).includes(q)))) out.push({ sheetId: sh.id, r, c, k });
       }
@@ -652,10 +750,11 @@ export function findDialog(A, replace) {
     const order = A.view().sheets.map((s) => s.id);
     return out.sort((a, b) => order.indexOf(a.sheetId) - order.indexOf(b.sheetId) || a.r - b.r || a.c - b.c);
   };
-  const next = () => {
+  const next = async () => {
+    if (!(await searchable())) return;
     const list = matches();
     A.S.find = { ...opts(), hit: null };
-    if (!list.length) { status.textContent = 'No matches.'; A.renderGrid(); return; }
+    if (!list.length) { status.textContent = 'No matches.' + note(); A.renderGrid(); return; }
     const cur = { sheetId: A.S.sheetId, r: A.S.sel.r, c: A.S.sel.c };
     const order = A.view().sheets.map((s) => s.id);
     const after = (m) => order.indexOf(m.sheetId) > order.indexOf(cur.sheetId) || (m.sheetId === cur.sheetId && (m.r > cur.r || (m.r === cur.r && m.c > cur.c)));
@@ -664,7 +763,7 @@ export function findDialog(A, replace) {
     A.selectRect({ r1: hit.r, c1: hit.c, r2: hit.r, c2: hit.c });
     A.scrollIntoView(hit.r, hit.c);
     A.S.find.hit = hit;
-    status.textContent = `${list.indexOf(hit) + 1} of ${list.length}`;
+    status.textContent = `${list.indexOf(hit) + 1} of ${list.length}` + note();
     A.renderGrid();
   };
   const replaceIn = (cell, o) => {
@@ -676,7 +775,7 @@ export function findDialog(A, replace) {
   const replaceOne = () => {
     const o = opts();
     const hit = A.S.find && A.S.find.hit;
-    if (!hit || !A.canEdit()) { next(); return; }
+    if (!hit || !A.canEdit()) return next();
     const sh = A.view().sheets.find((s) => s.id === hit.sheetId);
     const cell = sh && sh.cells[hit.k];
     if (cell && cell.v !== undefined && (cell.v[0] !== '=' || o.formulas)) {
@@ -684,10 +783,11 @@ export function findDialog(A, replace) {
       const p = cell.v[0] === '=' ? { raw: v } : parseInput(v, A.LOCALE);
       A.commit([{ t: 'set', s: sh.id, k: hit.k, v: p.raw || null }], { label: 'Replace' });
     }
-    next();
+    return next();
   };
-  const replaceAll = () => {
+  const replaceAll = async () => {
     if (!A.canEdit()) return;
+    if (!(await searchable())) return;
     const o = opts();
     const list = matches();
     const ops = [];
@@ -700,17 +800,18 @@ export function findDialog(A, replace) {
       const p = cell.v[0] === '=' ? { raw: v } : parseInput(v, A.LOCALE);
       ops.push({ t: 'set', s: sh.id, k: m.k, v: p.raw || null });
     }
-    if (A.commit(ops, { label: 'Replace all' })) status.textContent = ops.length === 1 ? 'Replaced 1 cell.' : 'Replaced ' + ops.length + ' cells.';
+    if (A.commit(ops, { label: 'Replace all' })) status.textContent = (ops.length === 1 ? 'Replaced 1 cell.' : 'Replaced ' + ops.length + ' cells.') + note();
   };
   what.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); next(); } });
   const replaceRow = h('div', { class: 'row2' }, field('Replace with', repl));
   replaceRow.hidden = !replace;
   const body = h('div', { class: 'form' }, field('Find', what), replaceRow, h('div', { class: 'checks' }, matchCase.el, whole.el, formulas.el), field('Search', scope), status);
-  dialog(replace ? 'Find and replace' : 'Find', body, [
+  // the buttons wait for the search (values may be computed first)
+  const dlg = dialog(replace ? 'Find and replace' : 'Find', body, [
     replace || !A.canEdit() ? null : { label: 'Replace…', action: () => { replaceRow.hidden = false; repl.focus(); return false; } },
-    replace ? { label: 'Replace', action: () => { replaceOne(); return false; } } : null,
-    replace ? { label: 'Replace all', action: () => { replaceAll(); return false; } } : null,
-    { label: 'Find next', primary: true, action: () => { next(); return false; } }
+    replace ? { label: 'Replace', action: async () => { await replaceOne(); return false; } } : null,
+    replace ? { label: 'Replace all', action: async () => { await replaceAll(); return false; } } : null,
+    { label: 'Find next', primary: true, action: async () => { await next(); return false; } }
   ].filter(Boolean), { onClose: () => { if (A.S.find) A.S.find.hit = null; A.renderGrid(); A.focusGrid(); } });
 }
 
@@ -739,7 +840,7 @@ export function namesDialog(A, defineFromSelection) {
       { label: 'Cancel' },
       { label: 'Save', primary: true, action: () => {
         const nn = n.value.trim();
-        if (!Core.NAME_RE.test(nn) || /^[A-Za-z]{1,3}\d+$/.test(nn) || /^(TRUE|FALSE)$/i.test(nn)) { toast('That name is not allowed.', 'error'); return false; }
+        if (!Core.validName(nn) || /^[A-Za-z]{1,3}\d+$/.test(nn) || /^(TRUE|FALSE)$/i.test(nn)) { toast('That name is not allowed.', 'error'); return false; }
         let rr = r.value.trim();
         if (!rr) { toast('Enter what the name refers to.', 'error'); return false; }
         if (rr[0] !== '=') rr = '=' + rr;
@@ -763,16 +864,19 @@ export async function sizeDialog(A, axis) {
   if (!A.canEdit()) return;
   const sh = A.sheet();
   const s = A.selRect();
-  const cur = axis === 'c' ? (sh.colW[sh.cols[s.c1]] || 100) : (sh.rowH[sh.rows[s.r1]] || 24);
+  const cur = axis === 'c' ? ((sh.colW || {})[sh.cols[s.c1]] || 100) : ((sh.rowH || {})[sh.rows[s.r1]] || 24);
   const v = await promptDialog(axis === 'c' ? 'Column width' : 'Row height', axis === 'c' ? 'Width in pixels' : 'Height in pixels', String(cur), { type: 'number', min: axis === 'c' ? 16 : 8, max: 2000 });
   if (v === null) return;
   const n = Math.round(+v);
   if (!(n >= (axis === 'c' ? 16 : 8) && n <= 2000)) { toast('Enter a number between ' + (axis === 'c' ? 16 : 8) + ' and 2000.', 'error'); return; }
+  // the columns (rows) of every selected range
   const patch = {};
-  if (axis === 'c') for (let c = s.c1; c <= s.c2; c++) patch[sh.cols[c]] = n;
-  else for (let r = s.r1; r <= s.r2; r++) patch[sh.rows[r]] = n;
+  for (const i of A.selLines(axis)) patch[(axis === 'c' ? sh.cols : sh.rows)[i]] = n;
   A.commit([{ t: 'sheet', s: sh.id, [axis === 'c' ? 'colW' : 'rowH']: patch }], { label: 'Size' });
 }
+
+const FORMAT_PRESETS = ['0', '0.00', '#,##0', '#,##0.00', '0%', '0.00%', '#,##0.00 "₺"', '"$"#,##0.00', 'dd.mm.yyyy', 'yyyy-mm-dd', 'dd mmmm yyyy', 'dddd', 'hh:mm', 'hh:mm:ss', 'mmm yy', '0.00E+00', '#,##0;[Red]-#,##0'];
+const PATTERN_HELP = '0 digit, # optional digit, , thousands, % percent; d m y h s for dates and times; "text" in quotes';
 
 export function customFormatDialog(A, setFormat) {
   const sh = A.sheet();
@@ -781,15 +885,163 @@ export function customFormatDialog(A, setFormat) {
   const st = (M.cellAt(sh, A.S.sel.r, A.S.sel.c) || {}).st || {};
   const pat = h('input', { class: 'input mono', value: st.pat || '#,##0.00', spellcheck: 'false' });
   const preview = h('div', { class: 'preview mono' });
-  const presets = ['0', '0.00', '#,##0', '#,##0.00', '0%', '0.00%', '#,##0.00 "₺"', '"$"#,##0.00', 'dd.mm.yyyy', 'yyyy-mm-dd', 'dd mmmm yyyy', 'dddd', 'hh:mm', 'hh:mm:ss', 'mmm yy', '0.00E+00', '#,##0;[Red]-#,##0'];
+  const presets = FORMAT_PRESETS;
   const list = h('div', { class: 'preset-list' }, presets.map((p) => h('button', { class: 'chip-btn mono', type: 'button', onclick: () => { pat.value = p; upd(); } }, p)));
   const upd = () => { preview.textContent = 'Preview: ' + formatWithPattern(sample, pat.value, A.LOCALE); };
   pat.addEventListener('input', upd);
   upd();
-  dialog('Custom number format', h('div', { class: 'form' }, field('Format', pat, '0 digit, # optional digit, , thousands, % percent; d m y h s for dates and times; "text" in quotes'), preview, list), [
+  dialog('Custom number format', h('div', { class: 'form' }, field('Format', pat, PATTERN_HELP), preview, list), [
     { label: 'Cancel' },
     { label: 'Apply', primary: true, action: () => setFormat({ nf: 'custom', pat: pat.value }) }
   ]);
+}
+
+/* ---------------------------------------------------------------- format cells */
+
+const NF_CATEGORIES = [['gen', 'Automatic'], ['num', 'Number'], ['cur', 'Currency'], ['acc', 'Accounting'], ['pct', 'Percent'], ['sci', 'Scientific'],
+  ['date', 'Date'], ['ldate', 'Long date'], ['time', 'Time'], ['dt', 'Date time'], ['dur', 'Duration'], ['text', 'Plain text'], ['custom', 'Custom']];
+const WITH_DECIMALS = ['num', 'cur', 'acc', 'pct', 'sci'];
+const MAX_DP = 15; // as stored (sheet-core.js cleanStyle)
+const DP_MSG = 'Decimal places must be a whole number from 0 to ' + MAX_DP + '.';
+const BORDER_MODES = [['', 'No change'], ['all', 'All borders'], ['outer', 'Outside borders'], ['inner', 'Inside borders'], ['thick', 'Thick outside border'],
+  ['top', 'Top border'], ['bottom', 'Bottom border'], ['left', 'Left border'], ['right', 'Right border'], ['none', 'No borders']];
+const FONT_SIZES = [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 36, 48];
+
+/**
+ * Format cells (the context menu, Format > Format cells…): number format, alignment, font, borders and fill of every
+ * selected range, as one change. It shows the active cell's format; only what is changed here is applied, so cells
+ * with other formats keep the rest of theirs.
+ */
+export function formatCellsDialog(A) {
+  if (!A.canEdit()) return;
+  const sh = A.sheet();
+  const st = A.curStyle();
+  const changed = new Set();
+  const on = (el, key, ev = 'change') => { el.addEventListener(ev, () => { changed.add(key); update(); }); return el; };
+
+  // number. Decimals go up to 15 as stored (sheet-core.js cleanStyle; .xlsx imports have them). Automatic with fixed
+  // decimals (the toolbar's decimal buttons, imported 0.00 formats) shows them, and an empty field drops them.
+  const nf0 = NF_CATEGORIES.some(([v]) => v === st.nf) ? st.nf : 'gen';
+  const genDp = nf0 === 'gen' && Number.isInteger(st.dp);
+  const category = select(NF_CATEGORIES, nf0, { 'aria-label': 'Category' });
+  // a category with decimals starts from its usual number of them when the field is empty
+  category.addEventListener('change', () => { if (WITH_DECIMALS.includes(category.value) && dp.value.trim() === '') dp.value = category.value === 'pct' ? '0' : '2'; });
+  on(category, 'nf');
+  const dp = on(h('input', { class: 'input', type: 'number', min: '0', max: String(MAX_DP), step: '1', value: String(Number.isInteger(st.dp) ? st.dp : nf0 === 'gen' ? '' : nf0 === 'pct' ? 0 : 2), 'aria-label': 'Decimal places' }), 'nf', 'input');
+  const symbols = A.currencies();
+  if (typeof st.cur === 'string' && st.cur && !symbols.includes(st.cur)) symbols.push(st.cur);
+  const symbol = on(select(symbols, st.nf === 'cur' && st.cur ? st.cur : symbols[0], { 'aria-label': 'Symbol' }), 'nf');
+  const pat = on(h('input', { class: 'input mono', value: typeof st.pat === 'string' ? st.pat : '#,##0.00', spellcheck: 'false', 'aria-label': 'Format' }), 'nf', 'input');
+  const presets = h('div', { class: 'preset-list' }, FORMAT_PRESETS.map((p) => h('button', { class: 'chip-btn mono', type: 'button', onclick: () => { pat.value = p; changed.add('nf'); update(); } }, p)));
+  const sample = h('div', { class: 'preview' });
+  const v = A.engine.valueAt(sh, A.S.sel.r, A.S.sel.c);
+  const decimals = () => Math.round(+dp.value);
+  const dpShown = (nf) => WITH_DECIMALS.includes(nf) || (nf === 'gen' && genDp);
+  // the decimals field holds a whole number from 0 to MAX_DP (for Automatic it may also be empty)
+  const dpOk = (nf) => {
+    if (!dpShown(nf)) return true;
+    if (dp.validity && dp.validity.badInput) return false; // text that is not a number reads as '' in a number field
+    const t = dp.value.trim();
+    if (nf === 'gen' && t === '') return true;
+    return t !== '' && Number.isInteger(+t) && +t >= 0 && +t <= MAX_DP;
+  };
+  const numberFormat = () => {
+    const nf = category.value;
+    if (nf === 'gen') return genDp && dp.value.trim() !== '' ? { nf, dp: decimals() } : {};
+    if (nf === 'cur') return { nf, cur: symbol.value, dp: decimals() };
+    if (WITH_DECIMALS.includes(nf)) return { nf, dp: decimals() };
+    if (nf === 'custom') return { nf, pat: pat.value };
+    return { nf };
+  };
+  const dpRow = field('Decimal places', dp), symbolRow = field('Symbol', symbol), patRow = h('div', { class: 'form' }, field('Format', pat, PATTERN_HELP), presets);
+
+  // alignment
+  const ha = on(select([['', 'General'], ['left', 'Left'], ['center', 'Center'], ['right', 'Right']], ['left', 'center', 'right'].includes(st.ha) ? st.ha : '', { 'aria-label': 'Horizontal' }), 'ha');
+  const va = on(select([['', 'Bottom'], ['middle', 'Middle'], ['top', 'Top']], ['middle', 'top'].includes(st.va) ? st.va : '', { 'aria-label': 'Vertical' }), 'va');
+  const wrap = checkbox('Wrap text', !!st.w);
+  on(wrap.input, 'w');
+
+  // font
+  const ff = on(select([['', 'Default'], ['serif', 'Serif'], ['mono', 'Monospace']], ['serif', 'mono'].includes(st.ff) ? st.ff : '', { 'aria-label': 'Font' }), 'ff');
+  const size0 = Number.isInteger(st.fs) && st.fs >= 6 && st.fs <= 72 ? st.fs : 13;
+  const fs = on(select([...new Set([...FONT_SIZES, size0])].sort((a, b) => a - b).map((n) => [String(n), String(n)]), String(size0), { 'aria-label': 'Size' }), 'fs');
+  const marks = [['b', 'Bold'], ['i', 'Italic'], ['u', 'Underline'], ['x', 'Strikethrough']].map(([k, label]) => { const cb = checkbox(label, !!st[k]); on(cb.input, k); return [k, cb]; });
+  // colors: only #rrggbb ones are taken over (they reach the color bars and the preview's style)
+  const colors = { fc: hexColor(st.fc), bg: hexColor(st.bg), bc: null };
+  const colorBtn = (key, label, reset) => {
+    const b = h('button', { class: 'btn small has-cbar', type: 'button', 'data-popup-anchor': '' }, label, h('span', { class: 'cbar', 'aria-hidden': 'true' }));
+    b.onclick = () => colorPicker(b.getBoundingClientRect(), colors[key], (c) => { colors[key] = hexColor(c); changed.add(key); update(); }, reset);
+    return b;
+  };
+  const fcBtn = colorBtn('fc', 'Text color', 'Automatic');
+  const fontPreview = h('div', { class: 'fmt-sample' }, 'AaBbCc 123');
+
+  // border and fill
+  const border = on(select(BORDER_MODES, '', { 'aria-label': 'Borders' }), 'bd');
+  const bcBtn = colorBtn('bc', 'Border color', 'Automatic');
+  const bgBtn = colorBtn('bg', 'Fill color', 'No fill');
+  const fillPreview = h('div', { class: 'fmt-sample' }, 'AaBbCc 123');
+
+  const panes = {
+    number: h('div', { class: 'form fmt-pane' }, field('Category', category), h('div', { class: 'row2' }, dpRow, symbolRow), patRow, sample),
+    align: h('div', { class: 'form fmt-pane' }, h('div', { class: 'row2' }, field('Horizontal', ha), field('Vertical', va)), wrap.el),
+    font: h('div', { class: 'form fmt-pane' }, h('div', { class: 'row2' }, field('Font', ff), field('Size', fs)), h('div', { class: 'checks cols' }, marks.map(([, cb]) => cb.el)), h('div', { class: 'row2' }, fcBtn), fontPreview),
+    border: h('div', { class: 'form fmt-pane' }, field('Borders', border, 'Each selected range gets its own borders.'), h('div', { class: 'row2' }, bcBtn)),
+    fill: h('div', { class: 'form fmt-pane' }, h('div', { class: 'row2' }, bgBtn), fillPreview)
+  };
+  const tabs = h('div', { class: 'opt-tabs', role: 'tablist' });
+  const show = (k) => {
+    Object.entries(panes).forEach(([key, p]) => { p.hidden = key !== k; });
+    tabs.querySelectorAll('button').forEach((b) => { const sel = b.dataset.tab === k; b.classList.toggle('on', sel); b.setAttribute('aria-selected', sel ? 'true' : 'false'); });
+  };
+  [['number', 'Number'], ['align', 'Alignment'], ['font', 'Font'], ['border', 'Border'], ['fill', 'Fill']].forEach(([k, label]) =>
+    tabs.appendChild(h('button', { class: 'opt-tab', type: 'button', role: 'tab', 'data-tab': k, onclick: () => show(k) }, label)));
+
+  function update() {
+    const nf = category.value;
+    dpRow.hidden = !dpShown(nf);
+    symbolRow.hidden = nf !== 'cur';
+    patRow.hidden = nf !== 'custom';
+    const x = typeof v === 'number' ? v : ['date', 'ldate', 'dt', 'time', 'dur'].includes(nf) ? 46000.5 : 1234.5678;
+    sample.textContent = dpOk(nf) ? 'Sample: ' + formatValue(x, numberFormat(), A.LOCALE) : DP_MSG;
+    paintBar(fcBtn, colors.fc, true);
+    paintBar(bcBtn, colors.bc, true);
+    paintBar(bgBtn, colors.bg, false);
+    // the preview shows the font and colors picked here, with the colors as the cells show them in the current theme
+    // (colors are #rrggbb, fonts and sizes come from the lists)
+    const tc = themedColors(colors.bg, colors.fc);
+    const css = tc.parts.slice();
+    css.push('font-family:' + (ff.value === 'serif' || ff.value === 'mono' ? 'var(--font-' + ff.value + ')' : 'inherit'), 'font-size:' + Math.min(28, +fs.value || 13) + 'px');
+    if (marks[0][1].input.checked) css.push('font-weight:600');
+    if (marks[1][1].input.checked) css.push('font-style:italic');
+    const deco = [marks[2][1].input.checked ? 'underline' : '', marks[3][1].input.checked ? 'line-through' : ''].filter(Boolean).join(' ');
+    if (deco) css.push('text-decoration:' + deco);
+    for (const el of [fontPreview, fillPreview]) { el.className = 'fmt-sample' + tc.cls; el.setAttribute('style', css.join(';')); }
+  }
+  update();
+  show('number');
+  dialog('Format cells', h('div', { class: 'fmt-cells' }, tabs, ...Object.values(panes)), [
+    { label: 'Cancel' },
+    { label: 'Apply', primary: true, action: () => {
+      const patch = {};
+      if (changed.has('nf')) {
+        const nf = category.value;
+        if (!dpOk(nf)) { show('number'); toast(DP_MSG, 'error'); dp.focus(); return false; }
+        if (nf === 'custom' && !pat.value.trim()) { show('number'); toast('Enter a format, such as #,##0.00.', 'error'); pat.focus(); return false; }
+        Object.assign(patch, { nf: null, dp: null, cur: null, pat: null }, numberFormat());
+      }
+      if (changed.has('ha')) patch.ha = ha.value || null;
+      if (changed.has('va')) patch.va = va.value || null;
+      if (changed.has('w')) patch.w = wrap.input.checked ? 1 : null;
+      if (changed.has('ff')) patch.ff = ff.value || null;
+      if (changed.has('fs')) patch.fs = +fs.value === 13 ? null : +fs.value;
+      for (const [k, cb] of marks) if (changed.has(k)) patch[k] = cb.input.checked ? 1 : null;
+      if (changed.has('fc')) patch.fc = colors.fc || null;
+      if (changed.has('bg')) patch.bg = colors.bg || null;
+      const bd = border.value ? { mode: border.value, color: colors.bc } : null;
+      if (Object.keys(patch).length || bd) A.formatCells(patch, bd);
+    } }
+  ], { class: 'fmt-dialog' });
 }
 
 const CATEGORIES = {
@@ -889,12 +1141,16 @@ export function historyPanel(A) {
   const show = (c) => (c && c.v !== undefined ? c.v : '');
   const entryEl = (e) => {
     const el = h('div', { class: 'hist-item' });
-    const who = h('div', { class: 'hist-who' }, h('span', { class: 'peer small', style: { background: peerColor(e.by) } }, initials(e.byName)), h('b', null, e.byName || e.by), h('span', { class: 'muted' }, relTime(e.at, 'en')));
+    // display names can be changed by their owner and look alike: the login (unique) is shown on hover, as in the bar
+    const byName = typeof e.byName === 'string' && e.byName ? e.byName : String(e.by || '');
+    const byLogin = typeof e.by === 'string' && e.by && e.by !== byName ? byName + ' (' + e.by + ')' : null;
+    const who = h('div', { class: 'hist-who' }, h('span', { class: 'peer small', style: { background: peerColor(e.by) } }, initials(byName)), h('b', { title: byLogin }, byName), h('span', { class: 'muted' }, relTime(e.at, 'en')));
     el.appendChild(who);
-    (e.events || []).forEach((ev) => el.appendChild(h('div', { class: 'hist-ev' }, ev)));
-    if (e.cells && e.cells.length) {
+    (Array.isArray(e.events) ? e.events : []).forEach((ev) => el.appendChild(h('div', { class: 'hist-ev' }, ev)));
+    const changed = objs(e.cells);
+    if (changed.length) {
       const cells = h('div', { class: 'hist-cells' });
-      e.cells.slice(0, 12).forEach((c) => {
+      changed.slice(0, 12).forEach((c) => {
         const from = show(c.from), to = show(c.to);
         const styleOnly = from === to;
         cells.appendChild(h('div', { class: 'hist-cell' }, h('span', { class: 'mono addr' }, (c.sn && A.view().sheets.length > 1 ? c.sn + '!' : '') + c.a),
@@ -905,14 +1161,14 @@ export function historyPanel(A) {
       el.appendChild(cells);
     }
     const actions = h('div', { class: 'hist-actions' });
-    if (canEdit && e.cells && e.cells.length && !e.more) {
+    if (canEdit && changed.length && !e.more) {
       actions.appendChild(h('button', { class: 'btn small', type: 'button', title: 'Put back the values these cells had before this change', onclick: () => {
         const view = A.view();
         const ops = [];
         let skipped = 0;
-        for (const c of e.cells) {
+        for (const c of changed) {
           const sh = view.sheets.find((s) => s.id === c.s);
-          if (!sh || c.trunc) { skipped++; continue; }
+          if (!sh || c.trunc || typeof c.k !== 'string') { skipped++; continue; }
           const [rid, cid] = c.k.split(':');
           if (!sh.rows.includes(rid) || !sh.cols.includes(cid)) { skipped++; continue; }
           ops.push({ t: 'set', s: c.s, k: c.k, v: c.from && c.from.v !== undefined ? c.from.v : null, st: c.from && c.from.st ? c.from.st : null });

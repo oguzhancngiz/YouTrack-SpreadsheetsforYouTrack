@@ -265,13 +265,17 @@ body.readonly .toolbar { display: none; }
 .grid td.fzc[style*="background"], .grid td.fzr[style*="background"], .grid td.fzc.f, .grid td.fzr.f { background-clip: padding-box; }
 /* user colors: fills and text colors are stored for the light theme; the dark theme gets darker fills and lighter text
    (cells and the rule previews of conditional formatting) */
-.grid td.cell.f, .cf-sample.f { background: var(--cbg); }
-.grid td.cell.c, .cf-sample.c { color: var(--cfc); }
-:is(.ring-ui-theme-dark, [data-theme=dark]) :is(.grid td.cell, .cf-sample).f { background: var(--cbg-d, var(--cbg)); }
-:is(.ring-ui-theme-dark, [data-theme=dark]) :is(.grid td.cell, .cf-sample).c { color: var(--cfc-d, var(--cfc)); }
+.grid td.cell.f, .cf-sample.f, .fmt-sample.f { background: var(--cbg); }
+.grid td.cell.c, .cf-sample.c, .fmt-sample.c { color: var(--cfc); }
+:is(.ring-ui-theme-dark, [data-theme=dark]) :is(.grid td.cell, .cf-sample, .fmt-sample).f { background: var(--cbg-d, var(--cbg)); }
+:is(.ring-ui-theme-dark, [data-theme=dark]) :is(.grid td.cell, .cf-sample, .fmt-sample).c { color: var(--cfc-d, var(--cfc)); }
 .grid tr:last-of-type td.fzr, .grid thead tr:last-child td { border-bottom: 2px solid var(--border); }
 .grid td.fzc:nth-last-child(1) { border-right-width: 2px; }
 .cv { overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; position: relative; isolation: isolate; }
+/* a merge's content box is as tall as the merge and starts at its top: its cell may run on past the drawn rows (into the
+   space below them), so the box is not placed at the cell's bottom; the box of a frozen part is clipped (.cvw) */
+.grid td.cell[rowspan], .grid td.cell[data-mr] { vertical-align: top; }
+.cvw { overflow: hidden; }
 .v-top .cv { justify-content: flex-start; }
 .v-middle .cv { justify-content: center; }
 .a-right .cv { text-align: right; }
@@ -499,6 +503,9 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); width: 14
 .tstyle span { height: 6px; border-radius: 1px; display: block; border: 1px solid transparent; }
 .tstyle .tb2 { background: var(--soft); }
 .preview { padding: 6px 8px; background: var(--soft); border-radius: var(--radius); }
+/* Format cells: the tabs keep one height, so the dialog does not jump when they switch */
+.fmt-pane { min-height: 236px; }
+.fmt-sample { border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; min-height: 48px; display: flex; align-items: center; overflow: hidden; white-space: nowrap; }
 .preset-list { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip-btn { border: 1px solid var(--line); background: var(--tag); border-radius: var(--radius); padding: 2px 6px; cursor: pointer; font-size: var(--fs-sm); }
 .chip-btn:hover { border-color: var(--border-hover); }
